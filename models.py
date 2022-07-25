@@ -7,7 +7,7 @@ import networkx as nx
 class ReverbNetwork(torch.nn.Module):
 
     def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_node: int = 0,
-                 inject_noise=True):
+                 inject_noise=False):
         super().__init__()
         self.architecture = structure.copy()
         self.activation = torch.nn.Sigmoid()
@@ -27,7 +27,7 @@ class ReverbNetwork(torch.nn.Module):
         self.architecture.add_edge(-1, self.input_node, operator=Reverb(node_shape[2], node_shape[3],
                                                                         kernel_size=4, in_channels=node_shape[1],
                                                                         out_channels=node_shape[1]))
-        self.inject_noise = True
+        self.inject_noise = inject_noise
 
     def parameters(self, recurse: bool = True):
         parameters = []
@@ -42,6 +42,7 @@ class ReverbNetwork(torch.nn.Module):
         nodes = sorted(list(self.architecture.nodes(data=True)))
 
         # preform natural weight updates
+        print("Default Update")
         for v, data in nodes:
             cur_state = data['state']
             if v != -1:
@@ -51,10 +52,12 @@ class ReverbNetwork(torch.nn.Module):
                 cur_state = cur_state + noise
             activation = self.activation(cur_state)
             self.architecture.nodes[v]['activation'] = activation
-            for u in self.architecture.predecessors(v):
-                self.architecture.edges[(u, v)]['operator'].update(activation)
+            with torch.no_grad():
+                for u in self.architecture.predecessors(v):
+                    self.architecture.edges[(u, v)]['operator'].update(activation)
 
         # preform forward pass
+        print("Signal Propagating")
         for v, data in nodes:
             if v == -1:
                 continue
@@ -70,15 +73,18 @@ class ReverbNetwork(torch.nn.Module):
 if __name__=='__main__':
     # test network
     torch.autograd.set_detect_anomaly(True)
-    structure = nx.complete_graph(4, create_using=nx.DiGraph)
-    revnet = ReverbNetwork(structure, input_node=1, node_shape=(1, 2, 16, 16))
-    optimizer = torch.optim.Adam(lr=.1, params=revnet.parameters())
-    for i in range(10):
+    structure = nx.complete_graph(1, create_using=nx.DiGraph)
+    for node in structure.nodes():
+        structure.add_edge(node, node)
+    revnet = ReverbNetwork(structure, input_node=0, node_shape=(1, 2, 16, 16))
+    optimizer = torch.optim.Adam(lr=.01, params=revnet.parameters())
+    for i in range(10000):
         optimizer.zero_grad()
         revnet.architecture.nodes[-1]['state'] = torch.normal(mean=0, std=.5, size=(1, 2, 16, 16))
         revnet.time_step()
-        loss = torch.sum(revnet.architecture.nodes[3]['state'].data.flatten())
+        loss = torch.sum(revnet.architecture.nodes[0]['state'].data.flatten())
         print(loss)
-        loss.backward(retain_graph=True)
+        loss.backward(retain_graph=False)
         optimizer.step()
+    print("done!")
 
