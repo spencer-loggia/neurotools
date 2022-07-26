@@ -22,9 +22,10 @@ class Reverb(torch.nn.Module):
         self.out_channels = out_channels
         self.spatial1 = spatial1
         self.spatial2 = spatial2
-        self.conv = torch.nn.Conv2d(kernel_size=1, in_channels=in_channels, out_channels=out_channels, bias=False)
+        evo_conv_weight = torch.empty((in_channels, out_channels))
+        self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(evo_conv_weight))
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
-        self.plasticity = torch.ones((in_channels,)).float() * init_plasticity
+        self.plasticity = torch.nn.Parameter(torch.ones((in_channels,)).float() * init_plasticity)
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size,
                                         padding=self.pad)
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size,
@@ -41,31 +42,38 @@ class Reverb(torch.nn.Module):
         weight_unfold = self.unfolder(self.weight)
         xufld = self.unfolder(x)
         self.activation_memory = xufld.clone()
+        local_conv = self.conv.clone()  # (inchan, outchan)
         h1 = weight_unfold * xufld
-        h2 = self.folder(h1)
-        y = self.conv(h2)
+        h2 = self.folder(h1)  # (1, in_chan, s0, s1)
+        h2 = h2.view(self.in_channels, self.spatial1 * self.spatial2)  # (1, s1, s0, in_chan)
+        y = h2.transpose(0, 1) @ local_conv
+        y = y.transpose(0, 1)
+        y = y.view((1, self.out_channels, self.spatial1, self.spatial2))
         return y.clone()
 
     def update(self, target_activations):
+        if torch.max(target_activations) > 1 or torch.min(target_activations) < 0:
+            print("WARN: Reverb  input activations are expected to have range 0 to 1")
+        if target_activations.shape[2:] != self.weight.shape[2:]:
+            raise ValueError("input of shape", target_activations.shape,
+                             "does not have compatible dimensionality with weights of shape", self.weight.shape)
         if self.activation_memory is None:
             return
-        target_activations = target_activations
+        target_activations = target_activations.view(self.out_channels, self.spatial1 * self.spatial2)
         mem_shape = self.activation_memory.shape
-        reverse_conv = torch.nn.Conv2d(kernel_size=1,
-                                       in_channels=self.out_channels,
-                                       out_channels=self.in_channels,
-                                       bias=False)
-        reverse_conv.weight = torch.nn.Parameter(self.conv.weight.detach().clone().transpose(0, 1))
-        local_space_target = reverse_conv(target_activations)  # 1 x c x s1 x s2
+        reverse_conv = self.conv.clone().transpose(0, 1)  # (out_chan, in_chan)
+        local_space_target = target_activations.transpose(0, 1) @ reverse_conv
+        local_space_target = local_space_target.transpose(0, 1)
+        local_space_target = local_space_target.view((1, self.in_channels, self.spatial1, self.spatial2))
         reshaped_local = self.activation_memory.view((self.kernel_size**2,
-                                                         self.in_channels,
-                                                         self.spatial1,
-                                                         self.spatial2))
+                                                      self.in_channels,
+                                                      self.spatial1,
+                                                      self.spatial2))
         delta1 = local_space_target * reshaped_local
-        delta2 = self.folder(delta1.view(mem_shape))
-        real_plast = .25 * torch.sigmoid(self.plasticity)
-        self.weight = (1 - real_plast.view((1, self.in_channels, 1, 1))) * \
-                      self.weight + (real_plast.view((1, self.in_channels, 1, 1)) * delta2)
+        delta2 = self.folder(delta1.reshape(mem_shape))
+        local_plast = self.plasticity.clone()
+        self.weight = (1 - local_plast.view((1, self.in_channels, 1, 1))) * \
+                      self.weight + (local_plast.view((1, self.in_channels, 1, 1)) * delta2)
 
 
 class ResistiveTensor(torch.nn.Module):

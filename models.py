@@ -12,7 +12,7 @@ class ReverbNetwork(torch.nn.Module):
         self.architecture = structure.copy()
         self.activation = torch.nn.Sigmoid()
         for node in self.architecture.nodes():
-            state = ResistiveTensor(node_shape, equilibrium=-.1, init_resistivity=.1)
+            state = torch.zeros(node_shape)
             self.architecture.nodes[node]['state'] = state
             self.architecture.nodes[node]['shape'] = node_shape
         for u, v in self.architecture.edges():
@@ -33,58 +33,55 @@ class ReverbNetwork(torch.nn.Module):
         parameters = []
         for u, v, data in self.architecture.edges(data=True):
             parameters += list(data['operator'].parameters())
-        for n, data in self.architecture.nodes(data=True):
-            if n != -1:
-                parameters += list(data['state'].parameters())
         return parameters
 
-    def time_step(self):
-        nodes = sorted(list(self.architecture.nodes(data=True)))
-
-        # preform natural weight updates
-        print("Default Update")
-        for v, data in nodes:
-            cur_state = data['state']
-            if v != -1:
-                cur_state = cur_state.data
-            if self.inject_noise:
-                noise = torch.normal(size=cur_state.shape, mean=0, std=.05)
-                cur_state = cur_state + noise
-            activation = self.activation(cur_state)
-            self.architecture.nodes[v]['activation'] = activation
-            with torch.no_grad():
-                for u in self.architecture.predecessors(v):
-                    self.architecture.edges[(u, v)]['operator'].update(activation)
-
+    def forward(self):
         # preform forward pass
-        print("Signal Propagating")
-        for v, data in nodes:
+        for v, data in self.architecture.nodes(data=True):
             if v == -1:
                 continue
+            self.architecture.nodes[v]['_future_state'] = torch.zeros(data['shape'])
             preds = self.architecture.predecessors(v)
+            pred_count = 0
             for u in preds:
                 fxn = self.architecture.edges[(u, v)]['operator']
-                activation = self.architecture.nodes[u]['activation']
+                state = self.architecture.nodes[u]['state']
+                activation = self.activation(state)
                 update = fxn(activation)
-                mod = self.architecture.nodes[v]['state'].clone()
-                self.architecture.nodes[v]['state'] = mod + update
+                self.architecture.nodes[v]['_future_state'] = self.architecture.nodes[v]['_future_state'] + update
+                pred_count += 1
+            self.architecture.nodes[v]['_future_state'] = self.architecture.nodes[v]['_future_state'] / pred_count
+            # hebbian update
+            preds = self.architecture.predecessors(v)
+            for u in preds:
+                self.architecture.edges[(u, v)]['operator'].update(self.activation(self.architecture.nodes[v]['_future_state']))
+
+        # set current state of all nodes to computed future
+        for n, data in self.architecture.nodes(data=True):
+            if n == -1:
+                continue
+            self.architecture.nodes[n]['state'] = data['_future_state'].clone()
 
 
 if __name__=='__main__':
     # test network
     torch.autograd.set_detect_anomaly(True)
-    structure = nx.complete_graph(1, create_using=nx.DiGraph)
+    structure = nx.complete_graph(2, create_using=nx.DiGraph)
     for node in structure.nodes():
         structure.add_edge(node, node)
     revnet = ReverbNetwork(structure, input_node=0, node_shape=(1, 2, 16, 16))
     optimizer = torch.optim.Adam(lr=.01, params=revnet.parameters())
-    for i in range(10000):
+    for e in range(100):
         optimizer.zero_grad()
         revnet.architecture.nodes[-1]['state'] = torch.normal(mean=0, std=.5, size=(1, 2, 16, 16))
-        revnet.time_step()
-        loss = torch.sum(revnet.architecture.nodes[0]['state'].data.flatten())
-        print(loss)
-        loss.backward(retain_graph=False)
+        revnet()
+        loss = torch.sum(revnet.architecture.nodes[0]['state'].flatten())
+        print("loss on epoch", e, "is", loss.detach().cpu().item())
+        loss.backward(retain_graph=True)
         optimizer.step()
+    for u, v, data in revnet.architecture.edges(data=True):
+        print("source:", u, "target:", v,
+              "projection_map_weight:", data['operator'].conv.detach(),
+              "projection_plasticities:", data['operator'].plasticity.detach())
     print("done!")
 
