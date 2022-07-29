@@ -16,8 +16,7 @@ class Reverb(torch.nn.Module):
         super().__init__()
         if spatial1 != spatial2:
             raise ValueError("Only square spatial inputs expected currently.")
-        weight = torch.empty((1, in_channels, spatial1, spatial2))
-        self.weight = torch.nn.init.xavier_normal_(weight)
+        self.weight = torch.ones((1, in_channels, spatial1, spatial2)) * .5
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.spatial1 = spatial1

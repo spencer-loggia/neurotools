@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch.multiprocessing import Pool
 from modules import ResistiveTensor, Reverb
@@ -20,13 +21,13 @@ class ReverbNetwork(torch.nn.Module):
             v_data = self.architecture.nodes[v]
             fxn = Reverb(u_data['shape'][2], u_data['shape'][3],
                          kernel_size=4, in_channels=u_data['shape'][1],
-                         out_channels=v_data['shape'][1])
+                         out_channels=v_data['shape'][1], init_plasticity=0.1)
             self.architecture.edges[(u, v)]['operator'] = fxn
         self.input_node = input_node
-        self.architecture.add_node(-1, state=torch.zeros(node_shape))
+        self.architecture.add_node(-1, state=torch.zeros(node_shape), shape=node_shape)
         self.architecture.add_edge(-1, self.input_node, operator=Reverb(node_shape[2], node_shape[3],
                                                                         kernel_size=4, in_channels=node_shape[1],
-                                                                        out_channels=node_shape[1]))
+                                                                        out_channels=node_shape[1], init_plasticity=0.1))
         self.inject_noise = inject_noise
 
     def parameters(self, recurse: bool = True):
@@ -61,6 +62,14 @@ class ReverbNetwork(torch.nn.Module):
             if n == -1:
                 continue
             self.architecture.nodes[n]['state'] = data['_future_state'].clone()
+
+    def detach(self):
+        for u, v, data in self.architecture.edges(data=True):
+            self.architecture.edges[(u, v)]['operator'].weight = torch.ones_like(data['operator'].weight) * .5
+            self.architecture.edges[(u, v)]['operator'].activation_memory = None
+        for n, data in self.architecture.nodes(data=True):
+            self.architecture.nodes[n]['state'] = torch.zeros(data['shape'])
+            self.architecture.nodes[n]['_future_state'] = torch.zeros(data['shape'])
 
 
 if __name__=='__main__':
