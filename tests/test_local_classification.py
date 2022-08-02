@@ -30,7 +30,7 @@ test_loader = torch.utils.data.DataLoader(
     batch_size=batch_size_test, shuffle=True)
 
 revnet_decoder = torch.nn.Sequential(torch.nn.MaxPool2d(2),
-                                     torch.nn.Conv2d(kernel_size=7, in_channels=1, out_channels=10))
+                                     torch.nn.Conv2d(kernel_size=14, in_channels=1, out_channels=10))
 present_frames = 10
 optimizer = torch.optim.Adam(lr=.01, params=list(revnet_decoder.parameters()) + list(revnet.parameters()))
 ce_loss = torch.nn.NLLLoss()
