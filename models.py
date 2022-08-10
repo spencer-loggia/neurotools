@@ -8,10 +8,11 @@ import networkx as nx
 class ReverbNetwork(torch.nn.Module):
 
     def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_node: int = 0,
-                 inject_noise=False):
+                 inject_noise=False, device='cpu'):
         super().__init__()
         self.architecture = structure.copy()
         self.activation = torch.nn.Sigmoid()
+        self.device = None
         for node in self.architecture.nodes():
             state = torch.zeros(node_shape)
             self.architecture.nodes[node]['state'] = state
@@ -30,6 +31,8 @@ class ReverbNetwork(torch.nn.Module):
                                                                         out_channels=node_shape[1], init_plasticity=0.1))
         self.inject_noise = inject_noise
 
+        self.to(device)
+
     def parameters(self, recurse: bool = True):
         parameters = []
         for u, v, data in self.architecture.edges(data=True):
@@ -41,7 +44,7 @@ class ReverbNetwork(torch.nn.Module):
         for v, data in self.architecture.nodes(data=True):
             if v == -1:
                 continue
-            self.architecture.nodes[v]['_future_state'] = torch.zeros(data['shape'])
+            self.architecture.nodes[v]['_future_state'] = torch.zeros(data['shape']).to(self.device)
             preds = self.architecture.predecessors(v)
             pred_count = 0
             for u in preds:
@@ -65,11 +68,19 @@ class ReverbNetwork(torch.nn.Module):
 
     def detach(self):
         for u, v, data in self.architecture.edges(data=True):
-            self.architecture.edges[(u, v)]['operator'].weight = torch.ones_like(data['operator'].weight) * .5
-            self.architecture.edges[(u, v)]['operator'].activation_memory = None
+            self.architecture.edges[(u, v)]['operator'].detach()
         for n, data in self.architecture.nodes(data=True):
-            self.architecture.nodes[n]['state'] = torch.zeros(data['shape'])
-            self.architecture.nodes[n]['_future_state'] = torch.zeros(data['shape'])
+            self.architecture.nodes[n]['state'] = torch.zeros(data['shape']).to(self.device)
+            self.architecture.nodes[n]['_future_state'] = torch.zeros(data['shape']).to(self.device)
+
+    def to(self, device):
+        self.device = device
+        self.detach()
+        for u, v, data in self.architecture.edges(data=True):
+            self.architecture.edges[(u, v)]['operator'].to(device)
+        for n, data in self.architecture.nodes(data=True):
+            self.architecture.nodes[n]['state'] = self.architecture.nodes[n]['state'].to(device)
+            self.architecture.nodes[n]['_future_state'] = self.architecture.nodes[n]['_future_state'].to(device)
 
 
 if __name__=='__main__':
