@@ -4,7 +4,7 @@ import util
 
 class Reverb(torch.nn.Module):
 
-    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, init_plasticity=.05):
+    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, init_plasticity=.05, device='cpu'):
         """
 
         :param spatial1: the spatial size. For now, always 2D, creates a spatial x spatial square.
@@ -31,6 +31,20 @@ class Reverb(torch.nn.Module):
                                     output_size=(spatial1, spatial2),
                                     padding=self.pad)
         self.activation_memory = None  # store unfolded most recent activation
+        self.device = 'cpu'
+
+        self.to(device)
+
+    def detach(self):
+        self.weight = torch.ones_like(self.weight) * .5
+        self.activation_memory = None
+
+    def to(self, device):
+        self.detach()
+        self.weight = self.weight.to(device)
+        self.plasticity = torch.nn.Parameter(self.plasticity.to(device))
+        self.conv = torch.nn.Parameter(self.conv.to(device))
+        self.device = device
 
     def forward(self, x):
         if torch.max(x) > 1 or torch.min(x) < 0:
