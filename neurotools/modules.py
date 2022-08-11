@@ -1,5 +1,5 @@
 import torch
-import util
+from neurotools import util
 
 
 class Reverb(torch.nn.Module):
@@ -16,7 +16,7 @@ class Reverb(torch.nn.Module):
         super().__init__()
         if spatial1 != spatial2:
             raise ValueError("Only square spatial inputs expected currently.")
-        self.weight = torch.ones((1, in_channels, spatial1, spatial2)) * .5
+        folded_weight = torch.ones((1, in_channels, spatial1, spatial2)) * .5
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.spatial1 = spatial1
@@ -30,6 +30,7 @@ class Reverb(torch.nn.Module):
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size,
                                     output_size=(spatial1, spatial2),
                                     padding=self.pad)
+        self.weight = self.unfolder(folded_weight)
         self.activation_memory = None  # store unfolded most recent activation
         self.device = 'cpu'
 
@@ -52,15 +53,18 @@ class Reverb(torch.nn.Module):
         if x.shape[1:] != self.weight.shape[1:]:
             raise ValueError("input of shape", x.shape,
                              "does not have compatible dimensionality with weights of shape", self.weight.shape)
-        weight_unfold = self.unfolder(self.weight)
+        # recall the input activations for computing hebbian update in update phase
+        self.activation_memory = x.clone()
+        # unfold x to synaptic space
         xufld = self.unfolder(x)
-        self.activation_memory = xufld.clone()
-        local_conv = self.conv.clone()  # (inchan, outchan)
-        h1 = weight_unfold * xufld
-        h2 = self.folder(h1)  # (1, in_chan, s0, s1)
+        local_conv = self.conv.clone()  # (inchan, outchan) create a unique node for this param state in comp graph
+        h1 = self.weight * xufld  # transmit along each edge
+        h2 = self.folder(h1)  # (1, in_chan, s0, s1) sum each receptive field, to output state space
+        # map all channels to output state channels  (grad optimized param)
         h2 = h2.view(self.in_channels, self.spatial1 * self.spatial2)  # (1, s1, s0, in_chan)
         y = h2.transpose(0, 1) @ local_conv
         y = y.transpose(0, 1)
+        # return output states in torch format
         y = y.view((1, self.out_channels, self.spatial1, self.spatial2))
         return y.clone()
 
@@ -72,21 +76,31 @@ class Reverb(torch.nn.Module):
                              "does not have compatible dimensionality with weights of shape", self.weight.shape)
         if self.activation_memory is None:
             return
+        # reverse the channel mapping so source channels receive information about the targets they actually innervate
         target_activations = target_activations.view(self.out_channels, self.spatial1 * self.spatial2)
-        mem_shape = self.activation_memory.shape
         reverse_conv = self.conv.clone().transpose(0, 1)  # (out_chan, in_chan)
         local_space_target = target_activations.transpose(0, 1) @ reverse_conv
         local_space_target = local_space_target.transpose(0, 1)
         local_space_target = local_space_target.view((1, self.in_channels, self.spatial1, self.spatial2))
-        reshaped_local = self.activation_memory.view((self.kernel_size**2,
-                                                      self.in_channels,
-                                                      self.spatial1,
-                                                      self.spatial2))
-        delta1 = local_space_target * reshaped_local
-        delta2 = self.folder(delta1.reshape(mem_shape))
+        # get joint activations
+        delta1 = self.activation_memory * local_space_target
+        # unfold joint activation matrix to synaptic space, and get a good view of delta and weights
+        # for broadcasting along channel dimension
+        delta2 = self.unfolder(delta1).view((self.kernel_size ** 2,
+                                             self.in_channels,
+                                             self.spatial1,
+                                             self.spatial2))
+        weight_shape = self.weight.shape
+        self.weight = self.weight.view((self.kernel_size ** 2,
+                                        self.in_channels,
+                                        self.spatial1,
+                                        self.spatial2))
         local_plast = self.plasticity.clone()
+
+        # preform associative update and take a standard unfolded view of the weights
         self.weight = (1 - local_plast.view((1, self.in_channels, 1, 1))) * \
                       self.weight + (local_plast.view((1, self.in_channels, 1, 1)) * delta2)
+        self.weight.view(weight_shape)
 
 
 class ResistiveTensor(torch.nn.Module):
@@ -107,4 +121,3 @@ class ResistiveTensor(torch.nn.Module):
         new_rt.equilibrium = self.equilibrium.clone()
         new_rt.resistivity = torch.nn.Parameter(self.resistivity.clone())
         return new_rt
-
