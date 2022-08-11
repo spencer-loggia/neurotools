@@ -93,3 +93,4 @@ class ResistiveTensor(torch.nn.Module):
         new_rt.equilibrium = self.equilibrium.clone()
         new_rt.resistivity = torch.nn.Parameter(self.resistivity.clone())
         return new_rt
+
