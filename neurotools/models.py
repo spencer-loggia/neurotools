@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch.multiprocessing import Pool
-from modules import ResistiveTensor, Reverb
+from neurotools.modules import Reverb
 import networkx as nx
 
 

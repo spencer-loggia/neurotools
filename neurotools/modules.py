@@ -50,13 +50,10 @@ class Reverb(torch.nn.Module):
     def forward(self, x):
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
-        if x.shape[1:] != self.weight.shape[1:]:
-            raise ValueError("input of shape", x.shape,
-                             "does not have compatible dimensionality with weights of shape", self.weight.shape)
-        # recall the input activations for computing hebbian update in update phase
-        self.activation_memory = x.clone()
         # unfold x to synaptic space
         xufld = self.unfolder(x)
+        # recall the input activations for computing hebbian update in update phase
+        self.activation_memory = xufld.clone()
         local_conv = self.conv.clone()  # (inchan, outchan) create a unique node for this param state in comp graph
         h1 = self.weight * xufld  # transmit along each edge
         h2 = self.folder(h1)  # (1, in_chan, s0, s1) sum each receptive field, to output state space
@@ -71,36 +68,30 @@ class Reverb(torch.nn.Module):
     def update(self, target_activations):
         if torch.max(target_activations) > 1 or torch.min(target_activations) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
-        if target_activations.shape[2:] != self.weight.shape[2:]:
-            raise ValueError("input of shape", target_activations.shape,
-                             "does not have compatible dimensionality with weights of shape", self.weight.shape)
         if self.activation_memory is None:
             return
+        # shape of chanel view of synaptic unfolded space
+        channel_view = (self.kernel_size ** 2, self.in_channels, self.spatial1, self.spatial2)
         # reverse the channel mapping so source channels receive information about the targets they actually innervate
         target_activations = target_activations.view(self.out_channels, self.spatial1 * self.spatial2)
         reverse_conv = self.conv.clone().transpose(0, 1)  # (out_chan, in_chan)
         local_space_target = target_activations.transpose(0, 1) @ reverse_conv
         local_space_target = local_space_target.transpose(0, 1)
         local_space_target = local_space_target.view((1, self.in_channels, self.spatial1, self.spatial2))
-        # get joint activations
-        delta1 = self.activation_memory * local_space_target
-        # unfold joint activation matrix to synaptic space, and get a good view of delta and weights
-        # for broadcasting along channel dimension
-        delta2 = self.unfolder(delta1).view((self.kernel_size ** 2,
-                                             self.in_channels,
-                                             self.spatial1,
-                                             self.spatial2))
-        weight_shape = self.weight.shape
-        self.weight = self.weight.view((self.kernel_size ** 2,
-                                        self.in_channels,
-                                        self.spatial1,
-                                        self.spatial2))
-        local_plast = self.plasticity.clone()
 
-        # preform associative update and take a standard unfolded view of the weights
+        synaptic_target = self.unfolder(local_space_target).view(channel_view)
+        local_activations = self.activation_memory.view(channel_view)
+        # get joint activations
+        delta = local_activations * synaptic_target
+        weight_shape = self.weight.shape
+        self.weight = self.weight.view(channel_view)
+
+        local_plast = self.plasticity.clone()  # track plasticity grad param state
+
+        # preform associative update and take a standard unfolded synaptic view of the weights
         self.weight = (1 - local_plast.view((1, self.in_channels, 1, 1))) * \
-                      self.weight + (local_plast.view((1, self.in_channels, 1, 1)) * delta2)
-        self.weight.view(weight_shape)
+                      self.weight + (local_plast.view((1, self.in_channels, 1, 1)) * delta)
+        self.weight = self.weight.view(weight_shape)
 
 
 class ResistiveTensor(torch.nn.Module):
