@@ -67,7 +67,7 @@ class Reverb(torch.nn.Module):
 
     def update(self, target_activations):
         if torch.max(target_activations) > 1 or torch.min(target_activations) < 0:
-            print("WARN: Reverb  input activations are expected to have range 0 to 1")
+            print("WARN: Reverb input activations are expected to have range 0 to 1")
         if self.activation_memory is None:
             return
         # shape of chanel view of synaptic unfolded space
@@ -112,3 +112,54 @@ class ResistiveTensor(torch.nn.Module):
         new_rt.equilibrium = self.equilibrium.clone()
         new_rt.resistivity = torch.nn.Parameter(self.resistivity.clone())
         return new_rt
+
+
+class MDScale:
+
+    def __init__(self, n, pairwise_distance: torch.Tensor, embed_dims: int = 2, device='cpu'):
+        """
+        Computes an embedding of n examples into a `embed_dims` space that attempts to maintain the provided pairwise
+        distances between examples
+        :param n: number of items
+        :param pairwise_distance: upper triangular vector of pairwise distance between examples, size n(n-1) / 2
+        :param embed_dims: number of dimensions to construct space in
+        :param device: device to use
+        """
+        self.num_items = n
+        self.pairwise_target = pairwise_distance.to(device)
+        self.mse = torch.nn.MSELoss()
+        self.embedding = torch.empty((n, embed_dims))
+        self.embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.embedding)).to(device)
+        self.device = device
+
+    def to(self, device):
+        self.embedding = self.embedding.to(device)
+        self.pairwise_target = self.pairwise_target.to(device)
+        return self
+
+    def stress(self):
+        """
+        An L2 Norm between distance in embedding space an actual provided pairwise distances
+        :param positions: Tensor of coordinates in embedding space
+        :return: torch.Tensor a stress score for the system
+        """
+        cur_dists = torch.pdist(self.embedding)
+        stress = self.mse(cur_dists, self.pairwise_target)
+        return stress
+
+    def fit(self, max_iter=5000):
+        optimizer = torch.optim.Adam(lr=.001, params=[self.embedding])
+        history = []
+        cur_iter = 0
+        while not util.is_converged(history) and cur_iter < max_iter:
+            optimizer.zero_grad()
+            loss = self.stress()
+            history.append(loss.detach().cpu().item())
+            loss.backward()
+            optimizer.step()
+        return history
+
+    def embeddings(self):
+        return self.embedding.detach().cpu()
+
+
