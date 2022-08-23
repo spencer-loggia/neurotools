@@ -2,6 +2,26 @@ import torch
 import networkx as nx
 
 
+
+def is_converged(loss_history, abs_tol=None, rel_tol=.0001, consider=5):
+    """
+    A heuristic metric of whether a model has converged
+    :param loss_history:
+    :param abs_tol: if provided overides rel_tol.
+    :param rel_tol: fraction of initial loss to consider as convergence tolerance.
+    :param consider: amount of previous loss examples to consider
+    :return:
+    """
+    if len(loss_history) < consider:
+        return False
+    if abs_tol is None:
+        abs_tol = loss_history[0] * rel_tol
+    loss_history = torch.Tensor(loss_history)
+    comp = loss_history[-1 * consider]
+    if abs(loss_history[(-1 * (consider - 1)):] - comp).mean() < abs_tol:
+        return True
+
+
 def conv_identity_params(in_spatial, desired_kernel):
     """
     finds convolution parameters that will maintain the same output shape
