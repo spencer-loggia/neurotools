@@ -1,8 +1,9 @@
 import torch
+import numpy as np
 import networkx as nx
 
 
-def is_converged(loss_history, abs_tol=.0001, consider=100):
+def is_converged(loss_history, abs_tol=.00001, consider=1000):
     """
     A heuristic metric of whether a model has converged
     :param loss_history:
@@ -14,8 +15,10 @@ def is_converged(loss_history, abs_tol=.0001, consider=100):
     if len(loss_history) < consider:
         return False
     loss_history = torch.Tensor(loss_history)
-    if (loss_history[(-1 * (consider - 1)):]).std() < abs_tol and (loss_history[-1] / loss_history[0]) < .1:
+    if (loss_history[(-1 * (consider - 1)):]).std() < abs_tol and (loss_history[-1] / loss_history[0]) < .75:
         return True
+    else:
+        return False
 
 
 def conv_identity_params(in_spatial, desired_kernel, stride=1):
@@ -62,4 +65,7 @@ def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatia
     # conform with Unfold modules output formatting.
     padded = padded.reshape(batch_size, kernel_channel_dim, spatial_flat_dim)
     return padded
+
+
+
 
