@@ -1,7 +1,9 @@
 import torch
+import numpy as np
+import networkx as nx
 
 
-def is_converged(loss_history, abs_tol=None, rel_tol=.0001, consider=5):
+def is_converged(loss_history, abs_tol=.00001, consider=1000):
     """
     A heuristic metric of whether a model has converged
     :param loss_history:
@@ -12,27 +14,34 @@ def is_converged(loss_history, abs_tol=None, rel_tol=.0001, consider=5):
     """
     if len(loss_history) < consider:
         return False
-    if abs_tol is None:
-        abs_tol = loss_history[0] * rel_tol
     loss_history = torch.Tensor(loss_history)
-    comp = loss_history[-1 * consider]
-    if abs(loss_history[(-1 * (consider - 1)):] - comp).mean() < abs_tol:
+    if (loss_history[(-1 * (consider - 1)):]).std() < abs_tol and (loss_history[-1] / loss_history[0]) < .75:
         return True
+    else:
+        return False
 
 
-def conv_identity_params(in_spatial, desired_kernel):
+def conv_identity_params(in_spatial, desired_kernel, stride=1):
     """
     finds convolution parameters that will maintain the same output shape
     :param in_spatial: spatial dimension to maintain
     :param desired_kernel: desired kernel, actual kernel may be smaller
+    :param stride: desired stride. desired output shape scaled by stride / ((stride -1) * kernel)
     :return:
+
     """
-    stride = 1
     pad = .1
+    in_spatial /= stride
     kernel = min(desired_kernel, in_spatial)
     while round(pad) != pad or pad >= kernel:
         # compute padding that will maintain spatial dims during actual conv
-        pad = (((in_spatial - 1) * stride) - in_spatial + kernel) / 2
+        # pad = (((in_spatial - 1) * stride) - in_spatial + kernel) / 2
+        if stride == 1:
+            out = in_spatial
+        else:
+            out = stride * in_spatial / ((stride - 1) * kernel)
+        if out.is_integer():
+            pad = (stride * (out - 1) - in_spatial + kernel) / 2
         if kernel < 2:
             raise RuntimeError("Could not find kernel pad combination to maintain dimensionality")
         kernel = max(kernel - 1, 1)
@@ -40,36 +49,23 @@ def conv_identity_params(in_spatial, desired_kernel):
     return kernel + 1, int(pad)
 
 
-def _compute_convolutional_sequence(in_spatial, out_spatial, in_channels, out_channels, mean=0., std=.01):
-    """
-    Return a spatial rescaling module to spatially scale from one node space to another
-    units of another.
-    :param in_spatial:
-    :param out_spatial:
-    :param in_channels:
-    :param out_channels:
-    :return:
-    """
-    stride = 1
-    pad = .1
-    kernel = min(6, in_spatial)
-    while round(pad) != pad or pad >= kernel:
-        # compute padding that will maintain spatial dims during actual conv
-        kernel = max(kernel - 1, 1)
-        pad = (((in_spatial - 1) * stride) - in_spatial + kernel) / 2
+def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatial_dims: int, stride=1):
+    pad = [padding] * (2 * spatial_dims)
+    batch_size = input_tensor.shape[0]
+    channel_size = input_tensor.shape[1]
+    padded = torch.nn.functional.pad(input_tensor, pad, "constant", 0)
+    for i in range(spatial_dims):
+        padded = padded.unfold(dimension=2 + i, size=kernel_size, step=stride)
+    kernel_channel_dim = channel_size
+    spatial_flat_dim = 1
+    for i in range(spatial_dims):
+        padded = padded.transpose(2 + i, 2 + spatial_dims + i)
+        kernel_channel_dim *= padded.shape[2 + i]
+        spatial_flat_dim *= padded.shape[2 + spatial_dims + i]
+    # conform with Unfold modules output formatting.
+    padded = padded.reshape(batch_size, kernel_channel_dim, spatial_flat_dim)
+    return padded
 
-    # now compute pool size needed to match spatial dims
-    if in_spatial >= out_spatial:
-        rescale_kernel = int(in_spatial / out_spatial)
-        rescale = torch.nn.MaxPool2d(rescale_kernel)
-        assert in_spatial / rescale_kernel == out_spatial
-    else:
-        rescale_kernel = int(out_spatial / in_spatial)
-        rescale = torch.nn.Upsample(scale_factor=rescale_kernel, mode='nearest')
-        assert in_spatial * rescale_kernel == out_spatial
-    conv = torch.nn.Conv2d(kernel_size=int(kernel), padding=int(pad), stride=1, in_channels=int(in_channels),
-                           out_channels=int(out_channels), bias=False)
-    weights = torch.nn.Parameter(torch.normal(mean, std, size=conv.weight.shape))
-    conv.weight = weights
-    activation = torch.nn.Tanh()
-    return conv, rescale, activation
+
+
+

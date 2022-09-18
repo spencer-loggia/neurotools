@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from neurotools import util
 
@@ -6,7 +7,8 @@ class Reverb(torch.nn.Module):
 
     def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, init_plasticity=.05, device='cpu'):
         """
-
+        Module that defines connection between two neuronal populations. The weight matrix for this module has an
+        intrinsic update function
         :param spatial1: the spatial size. For now, always 2D, creates a spatial x spatial square.
         :param spatial2: the spatial size. For now, always 2D, creates a spatial x spatial square.
         :param kernel_size: desired kernel size, may be altered to preserve spatial identity mapping
@@ -156,50 +158,200 @@ class ResistiveTensor(torch.nn.Module):
 
 class MDScale:
 
-    def __init__(self, n, pairwise_distance: torch.Tensor, embed_dims: int = 2, device='cpu'):
+    def __init__(self, n, embed_dims: int = 2, device='cpu'):
         """
         Computes an embedding of n examples into a `embed_dims` space that attempts to maintain the provided pairwise
         distances between examples
         :param n: number of items
-        :param pairwise_distance: upper triangular vector of pairwise distance between examples, size n(n-1) / 2
         :param embed_dims: number of dimensions to construct space in
         :param device: device to use
         """
         self.num_items = n
-        self.pairwise_target = pairwise_distance.to(device)
+        self.components = embed_dims
         self.mse = torch.nn.MSELoss()
-        self.embedding = torch.empty((n, embed_dims))
-        self.embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.embedding)).to(device)
+        self.right_latent = None
+        self.left_latent = None
         self.device = device
+        self.stress_history = None
 
     def to(self, device):
-        self.embedding = self.embedding.to(device)
-        self.pairwise_target = self.pairwise_target.to(device)
+        self.device = device
         return self
 
-    def stress(self):
+    def check_dists(self, dist):
+        """
+        function to check if distances are a vector or matrix, if a matrix returns just the flattened upper triangle if
+        symetric, or a tuple of upper and lower (flat) triangles if not symmetric.
+        :param num_items: number of items pairwise dists are for. (num rows and cols of distance matrix)
+        :param dist:
+        :return:
+        """
+        if isinstance(dist, np.ndarray):
+            dist = torch.from_numpy(dist).float()
+        if np.ndim(dist) == 2 and dist.shape[0] == self.num_items and dist.shape[1] == self.num_items:
+            # is a square distance matrix
+            sym = (dist.T == dist).all()
+            items = dist.shape[0]
+            upinds = torch.triu_indices(items, items, offset=1)
+            if sym:
+                dists = (dist[upinds[0], upinds[1]],)
+            else:
+                print("Similarity graph is directed. Embedding in and out dissimilarity separately.")
+                linds = torch.tril_indices(items, items, offset=-1)
+                dists = (dist[upinds[0], upinds[1]],
+                         dist[linds[0], linds[1]])
+
+        elif np.ndim(dist) == 1 and (dist.shape[0] * 2) / (self.num_items - 1) == self.num_items:
+            # is a triangular distance vector
+            dists = (dist,)
+        else:
+            raise ValueError("Provided distance matrix / vector is malformed.")
+        return dists
+
+    def stress(self, pairwise_target, positions):
         """
         An L2 Norm between distance in embedding space an actual provided pairwise distances
-        :param positions: Tensor of coordinates in embedding space
+        :param positions:
+        :param pairwise_target: upper triangular vector of pairwise distance between examples, size n(n-1) / 2
         :return: torch.Tensor a stress score for the system
         """
-        cur_dists = torch.pdist(self.embedding)
-        stress = self.mse(cur_dists, self.pairwise_target)
+        cur_dists = torch.pdist(positions)
+        # stress = self.mse(cur_dists, pairwise_target)
+        stress = torch.abs(cur_dists - pairwise_target)
+        stress = torch.pow(stress, 1.5)
+        stress = torch.mean(stress)
         return stress
 
-    def fit(self, max_iter=5000):
-        optimizer = torch.optim.Adam(lr=.001, params=[self.embedding])
+    def embed(self, dist_vec, max_iter=10000):
         history = []
         cur_iter = 0
-        while not util.is_converged(history) and cur_iter < max_iter:
+        embedding = torch.empty((self.num_items, self.components)).to(self.device)
+        embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(embedding))
+        optimizer = torch.optim.Adam(lr=.1, params=[embedding])
+        dist_vec = dist_vec.to(self.device)
+        cur_iter = 0
+        while not util.is_converged(history):
+            if cur_iter >= max_iter:
+                print("WARNING: Failed to converge in", max_iter, "iterations. "
+                      "Could be a solution was found, but the convergence tracker is dumb, just be careful!.")
+                break
             optimizer.zero_grad()
-            loss = self.stress()
+            loss = self.stress(dist_vec, embedding)
             history.append(loss.detach().cpu().item())
             loss.backward()
             optimizer.step()
-        return history
+            cur_iter += 1
+        self.stress_history = history
+        return embedding
 
-    def embeddings(self):
-        return self.embedding.detach().cpu()
+    def fit(self, pairwise_distance: torch.Tensor, max_iter=10000):
+        dists = self.check_dists(pairwise_distance)
+        self.right_latent = self.embed(dists[0], max_iter=max_iter)
+        print("Right Initial System Tension: ", self.stress_history[0])
+        print("Right Final System Tension: ", self.stress_history[-1])
+        if len(dists) == 2:
+            self.left_latent = self.embed(dists[1], max_iter=max_iter)
+            print("Left Initial System Tension: ", self.stress_history[0])
+            print("Left Final System Tension: ", self.stress_history[-1])
+
+    def fit_transform(self, pairwise_distance, max_iter=10000):
+        self.fit(pairwise_distance, max_iter=max_iter)
+        return self.predict()
+
+    def predict(self):
+        if self.left_latent is None:
+            return self.right_latent.detach().cpu()
+        else:
+            return self.right_latent.detach().cpu(), self.left_latent.detach().cpu()
+
+
+class SupervisedEmbed:
+
+    def __init__(self, n_components=2, device='cpu', dist_metric="euclidian",
+                 intra_class_weight=1., inter_class_weight=1., sparsity=1):
+        """
+        Finds three feature weight vectors that maximize the distance between the classes while minimizing the variance
+        within each class and maintaining component sparsity.
+        :param n_components: number of features to find
+        :param device: hardware to use
+        """
+        self.n_components = n_components
+        self.components = None
+        self.device = device
+        self.metric = dist_metric
+        self.sparsity = sparsity
+        self.intra_weight = intra_class_weight
+        self.inter_weight = inter_class_weight
+
+    def to(self, device):
+        if self.components is not None:
+            self.components = self.components.to(device)
+        self.device = device
+        return self
+
+    def feature_l1(self, comp):
+        comp_mag = torch.abs(comp)
+        return torch.sum(comp_mag.view(-1))
+
+    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01):
+        """
+        :param converge_var:
+        :param verbose:
+        :param X: items x features
+        :param y: target class
+        :param max_iter:
+        :return:
+        """
+        n_features = X.shape[1]
+        X = X.to(self.device)
+        y = y.to(self.device)
+        unique_targets = torch.unique(y)
+        self.components = torch.empty((n_features, self.n_components))
+        self.components = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.components).to(self.device))
+        cur_iter = 0
+        history = []
+        optimizer = torch.optim.Adam(lr=.01, params=[self.components])
+        while not util.is_converged(history, abs_tol=converge_var):
+            if cur_iter >= max_iter:
+                print("WARNING: Failed to converge in", max_iter, "iterations. "
+                      "Could be a solution was found, but the convergence tracker is dumb, just be careful!.")
+                break
+            optimizer.zero_grad()
+            std_components = self.get_components()
+            embed = X @ std_components
+            centers = []
+            loss = torch.zeros((1,)).to(self.device)
+            for t in unique_targets:
+                class_emb = embed[y == t]
+                center = torch.mean(class_emb, dim=0)
+                centers.append(center)
+                var = torch.std(class_emb, dim=0).mean()
+                loss += var
+            loss = (loss / len(unique_targets)) * self.intra_weight
+            centers = torch.stack(centers, dim=0)
+            space = torch.pdist(centers)
+            space = space.mean()
+            loss = loss - (self.inter_weight * space)
+            loss = loss + self.sparsity * self.feature_l1(std_components)
+            history.append(loss.detach().cpu().item())
+            if verbose:
+                print("iteration", cur_iter, "loss is", history[-1])
+            loss.backward()
+            optimizer.step()
+            cur_iter += 1
+        print("done in", cur_iter, "iterations")
+
+    def get_components(self):
+        if self.components is None:
+            print("Must fit first.")
+            return
+        std_components = (self.components - self.components.mean(dim=0).unsqueeze(0)) / self.components.std(dim=0).unsqueeze(0)
+        return std_components
+
+    def predict(self, X):
+        components = self.get_components()
+        embed = X.cpu() @ components
+        return embed.detach().cpu()
+
 
 
