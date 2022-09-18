@@ -94,6 +94,46 @@ class Reverb(torch.nn.Module):
         self.weight = self.weight.view(weight_shape)
 
 
+class WeightedConvolution(torch.nn.Module):
+
+    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels):
+        super().__init__()
+        self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
+        self.conv = torch.nn.Conv2d(kernel_size=self.kernel_size,
+                                    padding=self.pad,
+                                    in_channels=in_channels,
+                                    out_channels=out_channels)
+        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0, std=.1))
+        self.tanh = torch.nn.Tanh()
+        self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
+        self.folder = torch.nn.Fold(kernel_size=self.kernel_size, padding=self.pad,
+                                    output_size=(spatial1, spatial2))
+
+    def forward(self, x):
+        if torch.max(x) > 1 or torch.min(x) < 0:
+            print("WARN: Reverb  input activations are expected to have range 0 to 1")
+        # unfold x to synaptic space
+        xufld = self.unfolder(x)
+        conv_weight = torch.abs(self.conv.weight.clone())
+        conv_res = xufld.transpose(1, 2) @ conv_weight.view(conv_weight.shape[0], -1).t().transpose(1, 2)
+        conv_res = self.folder(conv_res)
+        weighted_out = conv_res * self.tanh(self.out_edge)
+        return weighted_out
+
+    def update(self):
+        """
+        No intrinsic update for this edge module type.
+        """
+        pass
+
+    def detach(self):
+        pass
+
+    def to(self, device):
+        self.conv.to(device)
+        self.out_edge.to(device)
+
+
 class ResistiveTensor(torch.nn.Module):
     def __init__(self, shape: tuple, equilibrium=-.1, init_resistivity=.1):
         super().__init__()

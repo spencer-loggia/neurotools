@@ -8,7 +8,7 @@ import networkx as nx
 class ReverbNetwork(torch.nn.Module):
 
     def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_node: int = 0,
-                 inject_noise=False, device='cpu'):
+                 inject_noise=False, edge_module=Reverb, device='cpu'):
         super().__init__()
         self.architecture = structure.copy()
         self.activation = torch.nn.Sigmoid()
