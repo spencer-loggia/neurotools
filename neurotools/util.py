@@ -15,7 +15,7 @@ def is_converged(loss_history, abs_tol=.00001, consider=1000):
     if len(loss_history) < consider:
         return False
     loss_history = torch.Tensor(loss_history)
-    if (loss_history[(-1 * (consider - 1)):]).std() < abs_tol and (loss_history[-1] / loss_history[0]) < .75:
+    if (loss_history[(-1 * (consider - 1)):]).std() < abs_tol:
         return True
     else:
         return False
