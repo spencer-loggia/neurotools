@@ -1,8 +1,210 @@
 import numpy as np
 import torch
+from neurotools import util
 from torch.multiprocessing import Pool
 from neurotools.modules import Reverb
 import networkx as nx
+
+
+class MDScale:
+
+    def __init__(self, n, embed_dims: int = 2, device='cpu'):
+        """
+        Computes an embedding of n examples into a `embed_dims` space that attempts to maintain the provided pairwise
+        distances between examples
+        :param n: number of items
+        :param embed_dims: number of dimensions to construct space in
+        :param device: device to use
+        """
+        self.num_items = n
+        self.components = embed_dims
+        self.mse = torch.nn.MSELoss()
+        self.right_latent = None
+        self.left_latent = None
+        self.device = device
+        self.stress_history = None
+
+    def to(self, device):
+        self.device = device
+        return self
+
+    def check_dists(self, dist):
+        """
+        function to check if distances are a vector or matrix, if a matrix returns just the flattened upper triangle if
+        symetric, or a tuple of upper and lower (flat) triangles if not symmetric.
+        :param num_items: number of items pairwise dists are for. (num rows and cols of distance matrix)
+        :param dist:
+        :return:
+        """
+        if isinstance(dist, np.ndarray):
+            dist = torch.from_numpy(dist).float()
+        if np.ndim(dist) == 2 and dist.shape[0] == self.num_items and dist.shape[1] == self.num_items:
+            # is a square distance matrix
+            sym = (dist.T == dist).all()
+            items = dist.shape[0]
+            upinds = torch.triu_indices(items, items, offset=1)
+            if sym:
+                dists = (dist[upinds[0], upinds[1]],)
+            else:
+                print("Similarity graph is directed. Embedding in and out dissimilarity separately.")
+                linds = torch.tril_indices(items, items, offset=-1)
+                dists = (dist[upinds[0], upinds[1]],
+                         dist[linds[0], linds[1]])
+
+        elif np.ndim(dist) == 1 and (dist.shape[0] * 2) / (self.num_items - 1) == self.num_items:
+            # is a triangular distance vector
+            dists = (dist,)
+        else:
+            raise ValueError("Provided distance matrix / vector is malformed.")
+        return dists
+
+    def stress(self, pairwise_target, positions):
+        """
+        An L2 Norm between distance in embedding space an actual provided pairwise distances
+        :param positions:
+        :param pairwise_target: upper triangular vector of pairwise distance between examples, size n(n-1) / 2
+        :return: torch.Tensor a stress score for the system
+        """
+        cur_dists = torch.pdist(positions)
+        # stress = self.mse(cur_dists, pairwise_target)
+        stress = torch.abs(cur_dists - pairwise_target)
+        stress = torch.pow(stress, 1.5)
+        stress = torch.mean(stress)
+        return stress
+
+    def embed(self, dist_vec, max_iter=10000, tol=.001):
+        history = []
+        cur_iter = 0
+        embedding = torch.empty((self.num_items, self.components)).to(self.device)
+        embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(embedding))
+        optimizer = torch.optim.Adam(lr=.1, params=[embedding])
+        dist_vec = dist_vec.to(self.device)
+        cur_iter = 0
+        while not util.is_converged(history, abs_tol=tol):
+            if cur_iter >= max_iter:
+                print("WARNING: Failed to converge in", max_iter, "iterations. "
+                                                                  "Could be a solution was found, but the convergence tracker is dumb, just be careful!.")
+                break
+            optimizer.zero_grad()
+            loss = self.stress(dist_vec, embedding)
+            history.append(loss.detach().cpu().item())
+            loss.backward()
+            optimizer.step()
+            cur_iter += 1
+        self.stress_history = history
+        return embedding
+
+    def fit(self, pairwise_distance: torch.Tensor, max_iter=10000, tol=.001):
+        dists = self.check_dists(pairwise_distance)
+        self.right_latent = self.embed(dists[0], max_iter=max_iter)
+        print("Right Initial System Tension: ", self.stress_history[0])
+        print("Right Final System Tension: ", self.stress_history[-1])
+        if len(dists) == 2:
+            self.left_latent = self.embed(dists[1], max_iter=max_iter, tol=tol)
+            print("Left Initial System Tension: ", self.stress_history[0])
+            print("Left Final System Tension: ", self.stress_history[-1])
+
+    def fit_transform(self, pairwise_distance, max_iter=10000, tol=.001):
+        self.fit(pairwise_distance, max_iter=max_iter, tol=tol)
+        return self.predict()
+
+    def predict(self):
+        if self.left_latent is None:
+            return self.right_latent.detach().cpu()
+        else:
+            return self.right_latent.detach().cpu(), self.left_latent.detach().cpu()
+
+
+class SupervisedEmbed:
+
+    def __init__(self, n_components=2, device='cpu', dist_metric="euclidian",
+                 intra_class_weight=1., inter_class_weight=1., sparsity=1):
+        """
+        Finds three feature weight vectors that maximize the distance between the classes while minimizing the variance
+        within each class and maintaining component sparsity.
+        :param n_components: number of features to find
+        :param device: hardware to use
+        """
+        self.n_components = n_components
+        self.components = None
+        self.device = device
+        self.metric = dist_metric
+        self.sparsity = sparsity
+        self.intra_weight = intra_class_weight
+        self.inter_weight = inter_class_weight
+
+    def to(self, device):
+        if self.components is not None:
+            self.components = self.components.to(device)
+        self.device = device
+        return self
+
+    def feature_ln(self, comp, degree):
+        return torch.sum(torch.pow(torch.abs(comp), degree), dim=0).mean()
+
+    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01):
+        """
+        :param converge_var:
+        :param verbose:
+        :param X: items x features
+        :param y: target class
+        :param max_iter:
+        :return:
+        """
+        n_features = X.shape[1]
+        X = X.to(self.device)
+        y = y.to(self.device)
+        unique_targets = torch.unique(y)
+        self.components = torch.empty((n_features, self.n_components))
+        self.components = torch.nn.Parameter(2 * torch.nn.init.xavier_normal_(self.components).to(self.device))
+        cur_iter = 0
+        history = []
+        optimizer = torch.optim.Adam(lr=.01, params=[self.components])
+        while not util.is_converged(history, abs_tol=converge_var):
+            if cur_iter >= max_iter:
+                print("WARNING: Failed to converge in", max_iter, "iterations. "
+                                                                  "Could be a solution was found, but the convergence tracker is dumb, just be careful!.")
+                break
+            optimizer.zero_grad()
+            std_components = self.get_components()
+            embed = X @ std_components
+            centers = []
+            loss = torch.zeros((1,)).to(self.device)
+            for t in unique_targets:
+                class_emb = embed[y == t]
+                center = torch.mean(class_emb, dim=0)
+                centers.append(center)
+                var = torch.std(class_emb, dim=0).mean()
+                loss += var
+            loss = (loss / len(unique_targets)) * self.intra_weight
+            centers = torch.stack(centers, dim=0)
+            space = torch.pdist(centers)
+            space = torch.pow(space, .85)
+            space = space.mean()
+            loss = loss - (self.inter_weight * space)
+            loss = loss + self.sparsity * self.feature_ln(std_components, .9)
+            orthaganality_loss = torch.abs(std_components.T @ std_components).mean()
+            loss = loss + orthaganality_loss
+            history.append(loss.detach().cpu().item())
+            if verbose:
+                print("iteration", cur_iter, "loss is", history[-1])
+            loss.backward()
+            optimizer.step()
+            cur_iter += 1
+        print("done in", cur_iter, "iterations")
+
+    def get_components(self):
+        if self.components is None:
+            print("Must fit first.")
+            return
+        std_components = (self.components - self.components.mean(dim=0)) / self.components.std(dim=0).unsqueeze(0)
+        std_components = std_components
+        return std_components
+
+    def predict(self, X):
+        components = self.get_components()
+        embed = X.cpu() @ components
+        return embed.detach().cpu()
 
 
 class ReverbNetwork(torch.nn.Module):
@@ -28,7 +230,8 @@ class ReverbNetwork(torch.nn.Module):
         self.architecture.add_node(-1, state=torch.zeros(node_shape), shape=node_shape)
         self.architecture.add_edge(-1, self.input_node, operator=Reverb(node_shape[2], node_shape[3],
                                                                         kernel_size=4, in_channels=node_shape[1],
-                                                                        out_channels=node_shape[1], init_plasticity=0.1))
+                                                                        out_channels=node_shape[1],
+                                                                        init_plasticity=0.1))
         self.inject_noise = inject_noise
 
         self.to(device)
@@ -58,7 +261,8 @@ class ReverbNetwork(torch.nn.Module):
             # hebbian update
             preds = self.architecture.predecessors(v)
             for u in preds:
-                self.architecture.edges[(u, v)]['operator'].update(self.activation(self.architecture.nodes[v]['_future_state']))
+                self.architecture.edges[(u, v)]['operator'].update(
+                    self.activation(self.architecture.nodes[v]['_future_state']))
 
         # set current state of all nodes to computed future
         for n, data in self.architecture.nodes(data=True):
@@ -81,27 +285,3 @@ class ReverbNetwork(torch.nn.Module):
         for n, data in self.architecture.nodes(data=True):
             self.architecture.nodes[n]['state'] = self.architecture.nodes[n]['state'].to(device)
             self.architecture.nodes[n]['_future_state'] = self.architecture.nodes[n]['_future_state'].to(device)
-
-
-if __name__=='__main__':
-    # test network
-    torch.autograd.set_detect_anomaly(True)
-    structure = nx.complete_graph(2, create_using=nx.DiGraph)
-    for node in structure.nodes():
-        structure.add_edge(node, node)
-    revnet = ReverbNetwork(structure, input_node=0, node_shape=(1, 2, 16, 16))
-    optimizer = torch.optim.Adam(lr=.01, params=revnet.parameters())
-    for e in range(100):
-        optimizer.zero_grad()
-        revnet.architecture.nodes[-1]['state'] = torch.normal(mean=0, std=.5, size=(1, 2, 16, 16))
-        revnet()
-        loss = torch.sum(revnet.architecture.nodes[0]['state'].flatten())
-        print("loss on epoch", e, "is", loss.detach().cpu().item())
-        loss.backward(retain_graph=True)
-        optimizer.step()
-    for u, v, data in revnet.architecture.edges(data=True):
-        print("source:", u, "target:", v,
-              "projection_map_weight:", data['operator'].conv.detach(),
-              "projection_plasticities:", data['operator'].plasticity.detach())
-    print("done!")
-
