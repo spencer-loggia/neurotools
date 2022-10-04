@@ -67,5 +67,37 @@ def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatia
     return padded
 
 
+def pearson_correlation(x1: torch.Tensor, x2: torch.Tensor, dim=0):
+    x1_mean = torch.mean(x1, dim=dim)
+    x2_mean = torch.mean(x2, dim=dim)
+    x1c = (x1 - x1_mean)
+    x2c = (x2 - x2_mean)
+    num = torch.sum(x1c * x2c)
+    sum_sq = torch.sum(torch.pow(x1c, 2)) * torch.sum(torch.pow(x2c, 2))
+    denom = torch.sqrt(sum_sq)
+    pearson = num / denom
+    return pearson
+
+
+def _get_ranks(x: torch.Tensor) -> torch.Tensor:
+    tmp = x.argsort()
+    ranks = torch.zeros_like(tmp)
+    ranks[tmp] = torch.arange(len(x))
+    return ranks
+
+
+def spearman_correlation(x: torch.Tensor, y: torch.Tensor):
+    """Compute correlation between 2 1-D vectors
+    Args:
+        x: Shape (N, )
+        y: Shape (N, )
+    """
+    x_rank = _get_ranks(x)
+    y_rank = _get_ranks(y)
+
+    n = x.size(0)
+    upper = 6 * torch.sum((x_rank - y_rank).pow(2))
+    down = n * (n ** 2 - 1.0)
+    return 1.0 - (upper / down)
 
 

@@ -5,7 +5,7 @@ from neurotools import util
 
 class Reverb(torch.nn.Module):
 
-    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, init_plasticity=.05, device='cpu'):
+    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):
         """
         Module that defines connection between two neuronal populations. The weight matrix for this module has an
         intrinsic update function
@@ -23,6 +23,10 @@ class Reverb(torch.nn.Module):
         self.out_channels = out_channels
         self.spatial1 = spatial1
         self.spatial2 = spatial2
+        if "init_plasticity" in kwargs:
+            init_plasticity = kwargs["init_plasticity"]
+        else:
+            init_plasticity = .1
         evo_conv_weight = torch.empty((in_channels, out_channels))
         self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(evo_conv_weight))
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
@@ -97,15 +101,17 @@ class Reverb(torch.nn.Module):
 
 
 class WeightedConvolution(torch.nn.Module):
+    """
+    Module that maps one 4D tensor to another using a positive convolution operation, weighted by a
+    scalar edge strength. Used as a component of Brain Network Estimation
+    """
 
-    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels):
+    def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):
         super().__init__()
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
-        self.conv = torch.nn.Conv2d(kernel_size=self.kernel_size,
-                                    padding=self.pad,
-                                    in_channels=in_channels,
-                                    out_channels=out_channels)
-        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0, std=.1))
+        conv = torch.empty((out_channels, in_channels, kernel_size, kernel_size))
+        self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv)).to(device)
+        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0, std=.1)).to(device)
         self.tanh = torch.nn.Tanh()
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size, padding=self.pad,
@@ -116,8 +122,8 @@ class WeightedConvolution(torch.nn.Module):
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         # unfold x to synaptic space
         xufld = self.unfolder(x)
-        conv_weight = torch.abs(self.conv.weight.clone())
-        conv_res = xufld.transpose(1, 2) @ conv_weight.view(conv_weight.shape[0], -1).t().transpose(1, 2)
+        conv_weight = torch.abs(self.conv.clone())
+        conv_res = (xufld.transpose(1, 2) @ conv_weight.view(conv_weight.size(0), -1).t()).transpose(1, 2)
         conv_res = self.folder(conv_res)
         weighted_out = conv_res * self.tanh(self.out_edge)
         return weighted_out

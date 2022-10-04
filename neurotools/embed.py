@@ -176,12 +176,14 @@ class SupervisedEmbed:
             loss = (loss / len(unique_targets)) * self.intra_weight
             centers = torch.stack(centers, dim=0)
             space = torch.pdist(centers)
-            space = torch.pow(space, .85)
             space = space.mean()
             loss = loss - (self.inter_weight * space)
-            loss = loss + self.sparsity * self.feature_ln(std_components, .9)
-            orthaganality_loss = torch.abs(std_components.T @ std_components).mean()
-            loss = loss + orthaganality_loss
+            loss = loss + self.sparsity * self.feature_ln(std_components, 1.0)
+            orthogonality_loss = torch.abs(std_components.T @ std_components).mean()
+            loss = loss + orthogonality_loss
+            if torch.isnan(loss):
+                raise ValueError("SL: numerical instability, loss is non-finite. Try again. "
+                                 "If recurring, adjust hyperparams")
             history.append(loss.detach().cpu().item())
             if verbose:
                 print("iteration", cur_iter, "loss is", history[-1])
