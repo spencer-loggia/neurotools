@@ -6,14 +6,16 @@ from neurotools import models, geometry, modules, util
 
 class FuzzyMental:
 
-    def __init__(self, target_beta_matrix, feature_names, atlas, roi_names, feature_generator, spatial, input_roi):
+    def __init__(self, target_beta_matrix, feature_names, atlas, roi_names, feature_generator, spatial, input_roi,
+                 stim_frames):
         """
         Designed to fit a Reverb Network to brain data.
         :param target_beta_matrix: (voxels x features) from processed mri data
         :param feature_names: (features) list
-        :param roi_labels: (voxels) roi index
+        :param atlas: (voxels) roi index
+        :param stim_frames: number of time steps to allow network for each frame from stim_gen
         :param roi_names: (rois) roi names
-        :param feature_generator: a class that must implement a "get_batch" method that returns
+        :param feature_generator: a class that must implement a "get_batch" method that yields
                                   tuple[(n, channel, spatial, spatial) Tensor, length n list of feature indexes] where
                                   the feature indexes correspond to those in feature_names and target_beta_matrix, and
                                   each feature in feature names is represented at least once.
@@ -25,8 +27,9 @@ class FuzzyMental:
         self.roi_names = roi_names
         self.stim_gen = feature_generator
         self.corr, self.idx_roi_map, self.rdms = geometry.pairwise_rsa(target_beta_matrix, atlas, min_roi_dim=5)
-        self.ror_idx_map = {self.roi_names[idx]:i for i, idx in enumerate(self.idx_roi_map)}
+        self.ror_idx_map = {self.roi_names[idx]: i for i, idx in enumerate(self.idx_roi_map)}
         self.input_node = self.ror_idx_map[self.roi_names[input_roi]]
+        self.stim_frames = stim_frames
         structure = nx.complete_graph(n=len(self.ror_idx_map), create_using=nx.DiGraph)
         for node in structure.nodes():
             structure.add_edge(node, node)
@@ -37,7 +40,7 @@ class FuzzyMental:
                                                  input_node=self.input_node,
                                                  track_activation_history=True)
 
-    def beta_correlation_loss(self, activation_states, run_list, num_conditions, paradigm_index, verbose=True):
+    def beta_correlation_loss(self, run_list, verbose=True):
         """
 
         :param activation_states: Dictionary keyed on nodes with list of state tensors of same length as run list. All
@@ -60,7 +63,7 @@ class FuzzyMental:
             betas = torch.transpose(torch.inverse(design_matrix.T @ design_matrix) @ design_matrix.T @ time_course,
                                     1,
                                     2)  # batch x n x k
-            betas = torch.mean(betas, dim=0)  # average out batch dimmension
+            betas = torch.mean(betas, dim=0)  # average out batch dimension
             rdm = geometry.dissimilarity(betas, metric='dot')
             target_brain_rdm = torch.Tensor(self.rdms[node])
             # compute the linear correlation between the model rdm at this node and the measured rdm at this roi
@@ -72,5 +75,22 @@ class FuzzyMental:
             print("computed beta coefficients")
         return loss
 
-    def fit(self):
-        raise NotImplementedError
+    def fit(self, local_epochs, meta_epochs, lr=0.01):
+        optimizer = torch.optim.Adam(lr=lr, params=self.reverb_model.parameters())
+        for meta in range(meta_epochs):
+            epoch_history = []
+            epoch = 0
+            while not util.is_converged(epoch_history, abs_tol=.01, consider=20) and epoch < local_epochs:
+                epoch += 1
+                batch, runlist = self.stim_gen.get_batch()
+                runlist = torch.Tensor(runlist)
+                self.reverb_model.detach()
+                optimizer.zero_grad()
+                for stim in batch:
+                    for i in range(self.stim_frames):
+                        self.reverb_model.architecture.nodes[-1]['state'] = stim
+                        self.reverb_model.forward()
+                loss = self.beta_correlation_loss(runlist)
+                epoch_history.append(loss.detach().cpu().item())
+                loss.backward()
+                optimizer.step()

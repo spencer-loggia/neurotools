@@ -17,31 +17,6 @@ def pdist_general(X, metric, **kwargs):
     return dm
 
 
-def _pad_to_cube(arr: np.ndarray, time_axis=3):
-    """
-    makes spatial dims have even size.
-    :param arr:
-    :param time_axis:
-    :return:
-    """
-    if time_axis < np.ndim(arr):
-        size = max(arr.shape[:time_axis] + arr.shape[time_axis+1:])
-        print(size)
-    else:
-        size = max(arr.shape)
-        # print('ruhroh')
-
-    ax_pad = [0] * np.ndim(arr)
-    for i in range(len(ax_pad)):
-        if i != time_axis:
-            ideal = (size - arr.shape[i]) / 2
-            ax_pad[i] = (int(np.floor(ideal)), int(np.ceil(ideal)))
-        else:
-            ax_pad[i] = (0, 0)
-    arr = np.pad(arr, ax_pad, mode='constant', constant_values=(0, 0))
-    return arr
-
-
 def _dot_pdist(arr: torch.Tensor, normalize=False):
     """
     arr should be 2D < observations(v) x conditions (k) >
