@@ -45,12 +45,8 @@ class FuzzyMental:
 
     def beta_correlation_loss(self, run_list, verbose=True):
         """
-
-        :param activation_states: Dictionary keyed on nodes with list of state tensors of same length as run list. All
-                                  node keys must exist in `self.structure`.
+        computes how well the network model matches functional representations in the brain
         :param run_list: order in which conditions were presented to network (num_frames x 1)
-        :param num_conditions:
-        :param paradigm_index: index of this paradigm in graph rdm list attribute
         :return: loss scalar, the total dissimilarity between representations at each node in `self.brain` with
                  representations at corresponding nodes in `self.structure`.
         """

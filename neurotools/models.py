@@ -59,7 +59,7 @@ class ReverbNetwork(torch.nn.Module):
                 self.architecture.nodes[v]['_future_state'] = self.architecture.nodes[v]['_future_state'] + update
                 pred_count += 1
             self.architecture.nodes[v]['_future_state'] = self.architecture.nodes[v]['_future_state'] / pred_count
-            # hebbian update
+            # updates.
             preds = self.architecture.predecessors(v)
             for u in preds:
                 self.architecture.edges[(u, v)]['operator'].update(
