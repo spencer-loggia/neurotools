@@ -1,3 +1,6 @@
+import copy
+
+import numpy as np
 import torch
 from neurotools.modules import Reverb, WeightedConvolution
 import networkx as nx
@@ -87,3 +90,39 @@ class ReverbNetwork(torch.nn.Module):
         for n, data in self.architecture.nodes(data=True):
             self.architecture.nodes[n]['state'] = self.architecture.nodes[n]['state'].to(device)
             self.architecture.nodes[n]['_future_state'] = self.architecture.nodes[n]['_future_state'].to(device)
+
+    def mutate(self):
+        weights = []
+        edges_ids = []
+        for u, v, data in self.architecture.edges(data=True):
+            if u == -1:
+                continue
+            weight = data['operator'].get_weight().detach().cpu().item()
+            weights.append(weight)
+        weights = torch.abs(torch.Tensor(weights))
+        max_weight = torch.max(weights)
+        weights = weights / max_weight
+        removal_probs = torch.pow(weights - 1, 2)
+        for i, edge in enumerate(edges_ids):
+            roll = torch.rand(size=(1,))
+            if roll < removal_probs[i]:
+                self.architecture.remove_edge(edge[0], edge[1])
+                print("removed edge (", edge[0], ",", edge[1], " with roll of", roll.item(),
+                      "against chance of", removal_probs[i].item())
+        # add edge modifier
+        add_prob = 1 / (len(self.architecture.nodes)**2)
+        for u, u_data in self.architecture.nodes(data=True):
+            for v, v_data in self.architecture.nodes(data=True):
+                roll = torch.rand(size=(1,))
+                if roll < add_prob:
+                    fxn = self.edge_module(u_data['shape'][2], u_data['shape'][3],
+                                           kernel_size=4, in_channels=u_data['shape'][1],
+                                           out_channels=v_data['shape'][1], init_plasticity=0.1)
+                    self.architecture.add_edge(u, v, operator=fxn)
+                    print("inserted edge (", u, ",", v, " with roll of", roll.item(),
+                          "against chance of", add_prob)
+
+    def clone(self):
+        new_net = copy.deepcopy(self)
+        new_net.detach()
+        return new_net

@@ -53,6 +53,9 @@ class Reverb(torch.nn.Module):
         self.conv = torch.nn.Parameter(self.conv.to(device))
         self.device = device
 
+    def get_weight(self):
+        return self.evo_conv_weight
+
     def forward(self, x):
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
@@ -111,7 +114,7 @@ class WeightedConvolution(torch.nn.Module):
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
         conv = torch.empty((out_channels, in_channels, kernel_size, kernel_size))
         self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv)).to(device)
-        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0, std=.1)).to(device)
+        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=.5, std=.1)).to(device)
         self.tanh = torch.nn.Tanh()
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size, padding=self.pad,
@@ -125,8 +128,13 @@ class WeightedConvolution(torch.nn.Module):
         conv_weight = torch.abs(self.conv.clone())
         conv_res = (xufld.transpose(1, 2) @ conv_weight.view(conv_weight.size(0), -1).t()).transpose(1, 2)
         conv_res = self.folder(conv_res)
-        weighted_out = conv_res * self.tanh(self.out_edge)
+        # conv res is standardized so weight comes from edge
+        conv_res = conv_res / torch.std(conv_res)
+        weighted_out = conv_res * self.out_edge
         return weighted_out
+
+    def get_weight(self):
+        return self.out_edge
 
     def update(self):
         """
@@ -135,11 +143,14 @@ class WeightedConvolution(torch.nn.Module):
         pass
 
     def detach(self):
-        pass
+        self.conv = self.conv.detach().clone()
+        self.out_edge = self.out_edge.detach().clone()
+        return self
 
     def to(self, device):
         self.conv.to(device)
         self.out_edge.to(device)
+        return self
 
 
 class ResistiveTensor(torch.nn.Module):

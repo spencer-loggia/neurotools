@@ -7,7 +7,7 @@ from neurotools import models, geometry, modules, util
 class FuzzyMental:
 
     def __init__(self, target_beta_matrix, feature_names, atlas, roi_names, feature_generator, spatial, input_roi,
-                 stim_frames):
+                 stim_frames, generations=20, population=5, max_iter=200):
         """
         Designed to fit a Reverb Network to brain data.
         :param target_beta_matrix: (voxels x features) from processed mri data
@@ -30,6 +30,9 @@ class FuzzyMental:
         self.ror_idx_map = {self.roi_names[idx]: i for i, idx in enumerate(self.idx_roi_map)}
         self.input_node = self.ror_idx_map[self.roi_names[input_roi]]
         self.stim_frames = stim_frames
+        self.generations = generations
+        self.population = population
+        self.max_iter = max_iter
         structure = nx.complete_graph(n=len(self.ror_idx_map), create_using=nx.DiGraph)
         for node in structure.nodes():
             structure.add_edge(node, node)
@@ -72,25 +75,37 @@ class FuzzyMental:
         # scale so loss stay comparable across prunings
         loss = loss / len(self.reverb_model.nodes)
         if verbose:
-            print("computed beta coefficients")
+            print("computed beta coef ficients")
         return loss
 
-    def fit(self, local_epochs, meta_epochs, lr=0.01):
+    def _fit(self, reverb_model, lr=0.01):
         optimizer = torch.optim.Adam(lr=lr, params=self.reverb_model.parameters())
-        for meta in range(meta_epochs):
-            epoch_history = []
-            epoch = 0
-            while not util.is_converged(epoch_history, abs_tol=.01, consider=20) and epoch < local_epochs:
-                epoch += 1
-                batch, runlist = self.stim_gen.get_batch()
-                runlist = torch.Tensor(runlist)
-                self.reverb_model.detach()
-                optimizer.zero_grad()
-                for stim in batch:
-                    for i in range(self.stim_frames):
-                        self.reverb_model.architecture.nodes[-1]['state'] = stim
-                        self.reverb_model.forward()
-                loss = self.beta_correlation_loss(runlist)
-                epoch_history.append(loss.detach().cpu().item())
-                loss.backward()
-                optimizer.step()
+        epoch_history = []
+        epoch = 0
+        while not util.is_converged(epoch_history, abs_tol=.01, consider=20) and epoch < self.max_iter:
+            epoch += 1
+            batch, runlist = self.stim_gen.get_batch()
+            runlist = torch.Tensor(runlist)
+            reverb_model.detach()
+            optimizer.zero_grad()
+            for stim in batch:
+                for i in range(self.stim_frames):
+                    reverb_model.architecture.nodes[-1]['state'] = stim
+                    reverb_model.forward()
+            loss = self.beta_correlation_loss(runlist)
+            epoch_history.append(loss.detach().cpu().item())
+            loss.backward()
+            optimizer.step()
+        return epoch_history[-1]
+
+    def fit(self):
+        for generation in range(self.generations):
+            print("**** SS: Generation", generation, "of", self.generations, "****")
+            pop = [self.reverb_model.clone().mutate() for _ in range(self.population)]
+            with torch.multiprocessing.Pool() as p:
+                res = p.starmap(self._fit, pop)
+            res = torch.Tensor(res)
+            print("SS: Generation fitness: ", res.detach().cpu().tolist())
+            best_idx = torch.argmin(res)
+            self.reverb_model = pop[best_idx]
+
