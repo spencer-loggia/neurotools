@@ -81,4 +81,4 @@ def pairwise_rsa(beta: torch.Tensor, atlas: torch.Tensor, min_roi_dim=5, ignore_
     ind = torch.triu_indices(len(unique_filtered), len(unique_filtered), offset=1)
     adjacency[ind[0], ind[1]] = corr
     adjacency = adjacency.T + adjacency
-    return adjacency, unique_filtered, roi_dissimilarity, None
+    return adjacency, unique_filtered, roi_dissimilarity

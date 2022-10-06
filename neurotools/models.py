@@ -14,6 +14,7 @@ class ReverbNetwork(torch.nn.Module):
         self.architecture = structure.copy()
         self.activation = torch.nn.Sigmoid()
         self.tracking = track_activation_history
+        self.edge_module = edge_module
         self.device = None
         for node in self.architecture.nodes():
             state = torch.zeros(node_shape)
@@ -81,6 +82,7 @@ class ReverbNetwork(torch.nn.Module):
             self.architecture.nodes[n]['_future_state'] = torch.zeros(data['shape']).to(self.device)
             if self.tracking:
                 self.architecture.nodes[n]['_past_states'] = []
+        return self
 
     def to(self, device):
         self.device = device
@@ -90,6 +92,7 @@ class ReverbNetwork(torch.nn.Module):
         for n, data in self.architecture.nodes(data=True):
             self.architecture.nodes[n]['state'] = self.architecture.nodes[n]['state'].to(device)
             self.architecture.nodes[n]['_future_state'] = self.architecture.nodes[n]['_future_state'].to(device)
+        return self
 
     def mutate(self):
         weights = []
@@ -99,10 +102,11 @@ class ReverbNetwork(torch.nn.Module):
                 continue
             weight = data['operator'].get_weight().detach().cpu().item()
             weights.append(weight)
+            edges_ids.append((u, v))
         weights = torch.abs(torch.Tensor(weights))
         max_weight = torch.max(weights)
         weights = weights / max_weight
-        removal_probs = torch.pow(weights - 1, 2)
+        removal_probs = torch.pow(abs(weights - 1), 3) / 2
         for i, edge in enumerate(edges_ids):
             roll = torch.rand(size=(1,))
             if roll < removal_probs[i]:
@@ -110,7 +114,7 @@ class ReverbNetwork(torch.nn.Module):
                 print("removed edge (", edge[0], ",", edge[1], " with roll of", roll.item(),
                       "against chance of", removal_probs[i].item())
         # add edge modifier
-        add_prob = 1 / (len(self.architecture.nodes)**2)
+        add_prob = 1 / (len(self.architecture.nodes)**3)
         for u, u_data in self.architecture.nodes(data=True):
             for v, v_data in self.architecture.nodes(data=True):
                 roll = torch.rand(size=(1,))
@@ -121,8 +125,9 @@ class ReverbNetwork(torch.nn.Module):
                     self.architecture.add_edge(u, v, operator=fxn)
                     print("inserted edge (", u, ",", v, " with roll of", roll.item(),
                           "against chance of", add_prob)
+        return self
 
     def clone(self):
+        self.detach()
         new_net = copy.deepcopy(self)
-        new_net.detach()
         return new_net

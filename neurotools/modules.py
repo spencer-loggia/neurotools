@@ -112,44 +112,49 @@ class WeightedConvolution(torch.nn.Module):
     def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):
         super().__init__()
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
-        conv = torch.empty((out_channels, in_channels, kernel_size, kernel_size))
+        conv = torch.empty((out_channels, in_channels, self.kernel_size, self.kernel_size))
         self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv)).to(device)
-        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=.5, std=.1)).to(device)
+        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0., std=.1)).to(device)
         self.tanh = torch.nn.Tanh()
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size, padding=self.pad,
                                     output_size=(spatial1, spatial2))
+        self.out_channel = out_channels
+        self.spatial1 = spatial1
+        self.spatial2 = spatial2
+        self.device = device
 
     def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError("Input Tensor Must Be 4D, not shape", x.shape)
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         # unfold x to synaptic space
-        xufld = self.unfolder(x)
-        conv_weight = torch.abs(self.conv.clone())
-        conv_res = (xufld.transpose(1, 2) @ conv_weight.view(conv_weight.size(0), -1).t()).transpose(1, 2)
-        conv_res = self.folder(conv_res)
+        xufld = self.unfolder(x).transpose(1, 2)
+        conv_weight = torch.abs(self.conv.clone()).view(self.conv.size(0), -1).t()
+        conv_res = (xufld @ conv_weight).transpose(1, 2)
+        conv_res = conv_res.view(-1, self.out_channel, self.spatial1, self.spatial2)
         # conv res is standardized so weight comes from edge
         conv_res = conv_res / torch.std(conv_res)
-        weighted_out = conv_res * self.out_edge
+        weighted_out = conv_res * self.out_edge.clone()
         return weighted_out
 
     def get_weight(self):
         return self.out_edge
 
-    def update(self):
+    def update(self, *args):
         """
         No intrinsic update for this edge module type.
         """
         pass
 
     def detach(self):
-        self.conv = self.conv.detach().clone()
-        self.out_edge = self.out_edge.detach().clone()
         return self
 
     def to(self, device):
         self.conv.to(device)
         self.out_edge.to(device)
+        self.device = device
         return self
 
 

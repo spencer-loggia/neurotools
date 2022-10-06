@@ -1,4 +1,4 @@
-from neurotools.modules import SupervisedEmbed
+from neurotools.models import SupervisedEmbed
 import torch
 import numpy as np
 from matplotlib import pyplot as plt
