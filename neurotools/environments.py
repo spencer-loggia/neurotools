@@ -136,3 +136,5 @@ class FuzzyMental:
             # choose model with highest correlation
             best_idx = torch.argmax(torch.nan_to_num(res, nan=-1, posinf=-1, neginf=-1))
             self.reverb_model = pop[best_idx]
+
+

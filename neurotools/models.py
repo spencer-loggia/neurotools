@@ -135,3 +135,15 @@ class ReverbNetwork(torch.nn.Module):
         self.detach()
         new_net = copy.deepcopy(self)
         return new_net
+
+
+class ElegantReverbNet:
+    """
+    A class intended to replace the old reverb network with more elegance (and better parallelization)
+    """
+    def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_nodes=(0,),
+                 inject_noise=False, edge_module=Reverb, device='cpu', track_activation_history=False):
+        self.num_nodes = len(structure)
+        self.states = torch.normal(size=(self.num_nodes, node_shape[1], node_shape[2], node_shape[3]), mean=0, std=.2)
+        # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
+        #

@@ -189,11 +189,12 @@ class ElegantWeightedConvolution(torch.nn.Module):
         if len(x.shape) != 4:
             raise ValueError("Input Tensor Must Be 4D, not shape", x.shape)
         if x.shape[0] != self.num_nodes:
-            raise ValueError("Input Tensor must have number of nodes on batch dimmension.")
+            raise ValueError("Input Tensor must have number of nodes on batch dimension.")
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(0, 1)  # channels * kernel * kernel, nodes, spatial1 * spatial2
         conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
+        # can't do regular old mat mul cuz don't want to use all n2 weights (just n) for each of n node
         iter_rule = "cus, uvoc -> uvos"
         conv_res = torch.einsum(iter_rule, xufld, conv_weight) # nodes, nodes, out_channels, spatial1 * spatial,
         conv_res = conv_res / conv_res.std(dim=(2, 3))[:, :, None, None]  # standardize so all magnitude comes from the out edge
