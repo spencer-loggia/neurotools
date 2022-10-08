@@ -171,7 +171,7 @@ class SupervisedEmbed:
                 class_emb = embed[y == t]
                 center = torch.mean(class_emb, dim=0)
                 centers.append(center)
-                var = torch.std(class_emb, dim=0).mean()
+                var = torch.abs(torch.cov(class_emb.T)).mean()
                 loss += var
             loss = (loss / len(unique_targets)) * self.intra_weight
             centers = torch.stack(centers, dim=0)
@@ -196,7 +196,7 @@ class SupervisedEmbed:
         if self.components is None:
             print("Must fit first.")
             return
-        std_components = (self.components - self.components.mean(dim=0)) / self.components.std(dim=0).unsqueeze(0)
+        std_components = (self.components) / self.components.std(dim=0).unsqueeze(0)
         std_components = std_components
         return std_components
 

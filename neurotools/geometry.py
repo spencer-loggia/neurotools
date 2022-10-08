@@ -5,10 +5,11 @@ from neurotools import util
 _distance_metrics_ = ['euclidian', 'pearson', 'spearman', 'dot', 'cosine']
 
 
-def pdist_general(X, metric, **kwargs):
+def pdist_general(X: torch.Tensor, metric, **kwargs):
     n = X.shape[0]
+    device = X.device
     out_size = (n * (n - 1)) // 2
-    dm = torch.zeros(out_size).float()
+    dm = torch.zeros(out_size, device=device).float()
     k = 0
     for i in range(X.shape[0] - 1):
         for j in range(i + 1, X.shape[0]):
@@ -57,28 +58,21 @@ def dissimilarity(beta: torch.Tensor, metric='dot'):
     return rdm
 
 
-def pairwise_rsa(beta: torch.Tensor, atlas: torch.Tensor, min_roi_dim=5, ignore_atlas_base=True, metric='cosine'):
-    if type(beta) is np.ndarray:
-        beta = torch.from_numpy(beta)
-    if type(atlas) is np.ndarray:
-        atlas = torch.from_numpy(atlas)
-    atlas = atlas.int()
-    unique = torch.unique(atlas)
-    if ignore_atlas_base:
-        # omit index 0 (unclassified)
-        unique = unique[1:]
-    unique_filtered = []
-    roi_dissimilarity = []
-    for roi_id in unique:
-        roi_betas = beta[atlas == roi_id].unsqueeze(0)
-        if roi_betas.shape[1] > min_roi_dim:
-            unique_filtered.append(roi_id)
-            rdm = dissimilarity(roi_betas, metric=metric)
-            roi_dissimilarity.append(rdm)
-    adjacency = torch.zeros([len(unique_filtered), len(unique_filtered)])
+def pairwise_rsa(data_region_list, rdm_metric='cosine', pairwise_metric='spearman'):
+    """
+    Compute rdms for entries in data_region_list, and their pairwise correlations.
+    :param data_region_list: a list of 2D tensors, each (data_points x features)
+    :param rdm_metric: metric to use when computing rdms
+    :param pairwise_metric: metric to use when computing pairwise correlations
+    :return: correlations adjacency matrix, list of rdms for each region
+    """
+    roi_dissimilarity = [dissimilarity(data, metric=rdm_metric) for data in data_region_list]
     dissim = torch.cat(roi_dissimilarity, dim=0)
-    corr = pdist_general(dissim, util.spearman_correlation)
-    ind = torch.triu_indices(len(unique_filtered), len(unique_filtered), offset=1)
-    adjacency[ind[0], ind[1]] = corr
-    adjacency = adjacency.T + adjacency
-    return adjacency, unique_filtered, roi_dissimilarity
+    if pairwise_metric == 'spearman':
+        fxn = util.spearman_correlation
+    elif pairwise_metric == 'pearson':
+        fxn = util.pearson_correlation
+    else:
+        raise ValueError
+    corr = pdist_general(dissim, fxn)
+    return corr, dissim

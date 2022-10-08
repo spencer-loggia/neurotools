@@ -68,12 +68,19 @@ def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatia
 
 
 def pearson_correlation(x1: torch.Tensor, x2: torch.Tensor, dim=0):
+    """
+    compute pearson correlation between two vectors.
+    :param x1: vector1 of size n
+    :param x2: vector2 of same size n
+    :param dim: if ndims > 1, dimension to compute corr along.
+    :return:
+    """
     x1_mean = torch.mean(x1, dim=dim)
     x2_mean = torch.mean(x2, dim=dim)
-    x1c = (x1 - x1_mean)
-    x2c = (x2 - x2_mean)
-    num = torch.sum(x1c * x2c)
-    sum_sq = torch.sum(torch.pow(x1c, 2)) * torch.sum(torch.pow(x2c, 2))
+    x1c = (x1 - x1_mean.unsqueeze(dim))
+    x2c = (x2 - x2_mean.unsqueeze(dim))
+    num = torch.sum(x1c * x2c, dim=dim)
+    sum_sq = torch.sum(torch.pow(x1c, 2), dim=dim) * torch.sum(torch.pow(x2c, 2), dim=dim)
     denom = torch.sqrt(sum_sq)
     pearson = num / denom
     return pearson
@@ -87,7 +94,7 @@ def _get_ranks(x: torch.Tensor) -> torch.Tensor:
 
 
 def spearman_correlation(x: torch.Tensor, y: torch.Tensor):
-    """Compute correlation between 2 1-D vectors
+    """Compute spearman correlation between 2 1-D vectors
     Args:
         x: Shape (N, )
         y: Shape (N, )
@@ -125,3 +132,49 @@ def _pad_to_cube(arr: np.ndarray, time_axis=3):
     return arr
 
 
+def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=5):
+    """
+    converts a matrix and corresponding atlas, to a list with data for each class
+    :param data_matrix:
+    :param atlas:
+    :param ignore_atlas_base: If true, will not create a list entry for items labelled 0 in the atlas.
+    :param min_dim: minimum number of datapoint necessary to include an atlas entry
+    :return: list of tensors, atlas label that each entry corresponds to.
+    """
+    if type(data_matrix) is np.ndarray:
+        data_matrix = torch.from_numpy(data_matrix)
+    if type(atlas) is np.ndarray:
+        atlas = torch.from_numpy(atlas)
+    atlas = atlas.int()
+    unique = torch.unique(atlas)
+    unique_filtered = []
+    class_data_list = []
+    for roi_id in unique:
+        if ignore_atlas_base and roi_id == 0:
+            continue
+        data = data_matrix[atlas == roi_id].unsqueeze(0)
+        if data.shape[1] > min_dim:
+            unique_filtered.append(roi_id)
+            class_data_list.append(data)
+    return class_data_list, unique_filtered
+
+
+def triu_to_square(triu_vector, n, includes_diag=False):
+    """
+    Converts an upper triangle vector to a full (redundant) symmetrical square matrix.
+    :param tri_vector: data point vector
+    :param n: size of resulting square
+    :param includes_diag: whether the main diagonal is included in triu_vector
+    :return: a symmetric square tensor
+    """
+    if includes_diag:
+        offset = 0
+    else:
+        offset = 1
+    adj = torch.zeros((n, n), dtype=torch.float)
+    ind = torch.triu_indices(n, n, offset=offset)
+    adj[ind[0], ind[1]] = triu_vector
+    adj = (adj.T + adj)
+    if includes_diag:
+        adj = adj - torch.diag(torch.diagonal(adj) / 2)
+    return adj

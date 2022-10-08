@@ -8,7 +8,7 @@ import networkx as nx
 
 class ReverbNetwork(torch.nn.Module):
 
-    def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_node: int = 0,
+    def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_nodes=(0,),
                  inject_noise=False, edge_module=Reverb, device='cpu', track_activation_history=False):
         super().__init__()
         self.architecture = structure.copy()
@@ -28,12 +28,13 @@ class ReverbNetwork(torch.nn.Module):
                               kernel_size=4, in_channels=u_data['shape'][1],
                               out_channels=v_data['shape'][1], init_plasticity=0.1)
             self.architecture.edges[(u, v)]['operator'] = fxn
-        self.input_node = input_node
+        self.input_nodes = input_nodes
         self.architecture.add_node(-1, state=torch.zeros(node_shape), shape=node_shape)
-        self.architecture.add_edge(-1, self.input_node, operator=edge_module(node_shape[2], node_shape[3],
-                                                                             kernel_size=4, in_channels=node_shape[1],
-                                                                             out_channels=node_shape[1],
-                                                                             init_plasticity=0.1))
+        for innode in self.input_nodes:
+            self.architecture.add_edge(-1, innode, operator=edge_module(node_shape[2], node_shape[3],
+                                                                                 kernel_size=4, in_channels=node_shape[1],
+                                                                                 out_channels=node_shape[1],
+                                                                                 init_plasticity=0.1))
         self.inject_noise = inject_noise
 
         self.to(device)
@@ -100,6 +101,9 @@ class ReverbNetwork(torch.nn.Module):
         for u, v, data in self.architecture.edges(data=True):
             if u == -1:
                 continue
+            if self.architecture.out_degree(u) == 1 or self.architecture.in_degree(v) == 1:
+                # don't want any node to have no out or in edges.
+                continue
             weight = data['operator'].get_weight().detach().cpu().item()
             weights.append(weight)
             edges_ids.append((u, v))
@@ -121,7 +125,7 @@ class ReverbNetwork(torch.nn.Module):
                 if roll < add_prob:
                     fxn = self.edge_module(u_data['shape'][2], u_data['shape'][3],
                                            kernel_size=4, in_channels=u_data['shape'][1],
-                                           out_channels=v_data['shape'][1], init_plasticity=0.1)
+                                           out_channels=v_data['shape'][1], init_plasticity=0.1, device=self.device)
                     self.architecture.add_edge(u, v, operator=fxn)
                     print("inserted edge (", u, ",", v, " with roll of", roll.item(),
                           "against chance of", add_prob)

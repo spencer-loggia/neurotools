@@ -112,9 +112,9 @@ class WeightedConvolution(torch.nn.Module):
     def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):
         super().__init__()
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
-        conv = torch.empty((out_channels, in_channels, self.kernel_size, self.kernel_size))
-        self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv)).to(device)
-        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0., std=.1)).to(device)
+        conv = torch.empty((out_channels, in_channels, self.kernel_size, self.kernel_size), device=device)
+        self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv))
+        self.out_edge = torch.nn.Parameter(torch.normal(size=(1,), mean=0., std=.1, device=device))
         self.tanh = torch.nn.Tanh()
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size, padding=self.pad,
@@ -129,6 +129,7 @@ class WeightedConvolution(torch.nn.Module):
             raise ValueError("Input Tensor Must Be 4D, not shape", x.shape)
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
+
         # unfold x to synaptic space
         xufld = self.unfolder(x).transpose(1, 2)
         conv_weight = torch.abs(self.conv.clone()).view(self.conv.size(0), -1).t()
@@ -152,8 +153,8 @@ class WeightedConvolution(torch.nn.Module):
         return self
 
     def to(self, device):
-        self.conv.to(device)
-        self.out_edge.to(device)
+        self.conv = torch.nn.Parameter(self.conv.to(device))
+        self.out_edge = torch.nn.Parameter(self.out_edge.to(device))
         self.device = device
         return self
 
