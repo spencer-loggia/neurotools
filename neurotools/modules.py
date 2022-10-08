@@ -103,6 +103,12 @@ class Reverb(torch.nn.Module):
         self.weight = self.weight.view(weight_shape)
 
 
+class ElegantReverb:
+    # TODO: add this when I find time, the Reverb edge module is really more of a hobby than real work lol
+    def __init__(self):
+        raise NotImplementedError
+
+
 class WeightedConvolution(torch.nn.Module):
     """
     Module that maps one 4D tensor to another using a positive convolution operation, weighted by a
@@ -131,14 +137,69 @@ class WeightedConvolution(torch.nn.Module):
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
 
         # unfold x to synaptic space
-        xufld = self.unfolder(x).transpose(1, 2)
-        conv_weight = torch.abs(self.conv.clone()).view(self.conv.size(0), -1).t()
-        conv_res = (xufld @ conv_weight).transpose(1, 2)
+        xufld = self.unfolder(x).transpose(1, 2) # 1, spatial1 * spatial2, channels * kernel * kernel
+        conv_weight = torch.abs(self.conv.clone()).view(self.conv.size(0), -1).t() # kernel * kernel * inchannels, out_channels
+        conv_res = (xufld @ conv_weight).transpose(1, 2)  # 1, out_channels, spatial1 * spatial2
         conv_res = conv_res.view(-1, self.out_channel, self.spatial1, self.spatial2)
         # conv res is standardized so weight comes from edge
         conv_res = conv_res / torch.std(conv_res)
         weighted_out = conv_res * self.out_edge.clone()
         return weighted_out
+
+    def get_weight(self):
+        return self.out_edge
+
+    def update(self, *args):
+        """
+        No intrinsic update for this edge module type.
+        """
+        pass
+
+    def detach(self):
+        return self
+
+    def to(self, device):
+        self.conv = torch.nn.Parameter(self.conv.to(device))
+        self.out_edge = torch.nn.Parameter(self.out_edge.to(device))
+        self.device = device
+        return self
+
+
+class ElegantWeightedConvolution(torch.nn.Module):
+
+    def __init__(self, num_nodes, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):
+        """
+        serves the same purpose as the standard weighted convolution, but designed to operate on a graph all at once.
+        should work better if you have hella v/tRAM and you're not expecting a super sparse graph.
+        """
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
+        conv = torch.empty((num_nodes, num_nodes, out_channels, in_channels, self.kernel_size, self.kernel_size),
+                           device=device)  # 6D Tensor.
+        self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv))
+        self.out_edge = torch.nn.Parameter(torch.normal(size=(num_nodes, num_nodes), mean=0., std=.1, device=device))
+        self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.spatial1 = spatial1
+        self.spatial2 = spatial2
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError("Input Tensor Must Be 4D, not shape", x.shape)
+        if x.shape[0] != self.num_nodes:
+            raise ValueError("Input Tensor must have number of nodes on batch dimmension.")
+        if torch.max(x) > 1 or torch.min(x) < 0:
+            print("WARN: Reverb  input activations are expected to have range 0 to 1")
+        xufld = self.unfolder(x).transpose(0, 1)  # channels * kernel * kernel, nodes, spatial1 * spatial2
+        conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
+        iter_rule = "cus, uvoc -> uvos"
+        conv_res = torch.einsum(iter_rule, xufld, conv_weight) # nodes, nodes, out_channels, spatial1 * spatial,
+        conv_res = conv_res / conv_res.std(dim=(2, 3))[:, :, None, None]  # standardize so all magnitude comes from the out edge
+        conv_res = conv_res * self.out_edge[:, :, None, None] # weight by out edge
+        conv_res = conv_res.mean(dim=1).view(self.num_nodes, self.out_channels, self.spatial1, self.spatial2)  # mean over the incoming edges, reshape spatial dims
+        return conv_res
 
     def get_weight(self):
         return self.out_edge
