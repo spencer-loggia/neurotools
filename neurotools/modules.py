@@ -167,7 +167,8 @@ class WeightedConvolution(torch.nn.Module):
 
 class ElegantWeightedConvolution(torch.nn.Module):
 
-    def __init__(self, num_nodes, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):
+    def __init__(self, num_nodes, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu',
+                 normalize_conv=True, **kwargs):
         """
         serves the same purpose as the standard weighted convolution, but designed to operate on a graph all at once.
         should work better if you have hella v/tRAM and you're not expecting a super sparse graph.
@@ -184,6 +185,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
         self.out_channels = out_channels
         self.spatial1 = spatial1
         self.spatial2 = spatial2
+        self.normalize = normalize_conv
 
     def forward(self, x):
         if len(x.shape) != 4:
@@ -193,13 +195,15 @@ class ElegantWeightedConvolution(torch.nn.Module):
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(0, 1)  # channels * kernel * kernel, nodes, spatial1 * spatial2
-        conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
+        if self.normalize:
+            conv_weight = torch.sigmoid(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
+        else:
+            conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1)
         # can't do regular old mat mul cuz don't want to use all n2 weights (just n) for each of n node
         iter_rule = "cus, uvoc -> uvos"
         conv_res = torch.einsum(iter_rule, xufld, conv_weight) # nodes, nodes, out_channels, spatial1 * spatial,
-        conv_res = conv_res / conv_res.std(dim=(2, 3))[:, :, None, None]  # standardize so all magnitude comes from the out edge
         conv_res = conv_res * self.out_edge[:, :, None, None] # weight by out edge
-        conv_res = conv_res.mean(dim=1).view(self.num_nodes, self.out_channels, self.spatial1, self.spatial2)  # mean over the incoming edges, reshape spatial dims
+        conv_res = conv_res.mean(dim=0).view(self.num_nodes, self.out_channels, self.spatial1, self.spatial2)  # mean over the incoming edges, reshape spatial dims
         return conv_res
 
     def get_weight(self):

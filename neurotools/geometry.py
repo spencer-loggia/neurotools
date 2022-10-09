@@ -43,7 +43,9 @@ def _pearson_pdist(arr: torch.Tensor):
 
 
 def dissimilarity(beta: torch.Tensor, metric='dot'):
-    if len(beta.shape) != 3:
+    if len(beta.shape) == 2:
+        beta = beta.unsqueeze(0)
+    elif len(beta.shape) != 3:
         raise IndexError("beta should be 3 dimensional and have batch on dim 0, observations on dim 1 and conditions on dim 2")
     if metric not in _distance_metrics_:
         raise ValueError('metric must be one of ' + str(_distance_metrics_))
@@ -61,7 +63,7 @@ def dissimilarity(beta: torch.Tensor, metric='dot'):
 def pairwise_rsa(data_region_list, rdm_metric='cosine', pairwise_metric='spearman'):
     """
     Compute rdms for entries in data_region_list, and their pairwise correlations.
-    :param data_region_list: a list of 2D tensors, each (data_points x features)
+    :param data_region_list: a list of 2D tensors, each (data_points x features) (or 3d tensor if all regions are same size)
     :param rdm_metric: metric to use when computing rdms
     :param pairwise_metric: metric to use when computing pairwise correlations
     :return: correlations adjacency matrix, list of rdms for each region

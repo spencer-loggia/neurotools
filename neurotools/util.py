@@ -44,7 +44,7 @@ def conv_identity_params(in_spatial, desired_kernel, stride=1):
             pad = (stride * (out - 1) - in_spatial + kernel) / 2
         if kernel < 2:
             raise RuntimeError("Could not find kernel pad combination to maintain dimensionality")
-        kernel = max(kernel - 1, 1)
+        kernel = max(kernel - 1, 0)
 
     return kernel + 1, int(pad)
 

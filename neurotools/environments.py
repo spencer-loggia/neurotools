@@ -8,6 +8,99 @@ def _set_mp_env():
     torch.multiprocessing.set_start_method('spawn')
 
 
+class ElegantFuzzyMental:
+    def __init__(self, target_beta_matrix, feature_names, atlas, roi_names: dict, feature_generator, spatial,
+                 stim_frames, generations=20, population=5, max_iter=1000, device='cpu', sparsity=0.1):
+        """
+        Designed to fit an ElegantReverbNetwork to braind data.
+        :param target_beta_matrix: (voxels x features) from processed mri data
+        :param feature_names: (features) list
+        :param atlas: (voxels) roi index. index of zero is taken to mean background and is not included.
+        :param stim_frames: number of time steps to allow network for each frame from stim_gen
+        :param roi_names: (rois) roi names
+        :param feature_generator: a class that must implement a "get_batch" method that yields
+                                  tuple[(n, channel, spatial, spatial) Tensor, length n list of feature indexes] where
+                                  the feature indexes correspond to those in feature_names and target_beta_matrix, and
+                                  each feature in feature names is represented at least once.m
+        """
+        assert len(feature_names) == target_beta_matrix.shape[-1]
+        self.feature_names = feature_names
+        self.atlas = atlas
+        self.roi_names = roi_names
+        self.device = device
+        self.stim_gen = feature_generator
+        beta_roi_list, self.idx_roi_map = util.atlas_to_list(target_beta_matrix, atlas, min_dim=5,
+                                                             ignore_atlas_base=True)
+        self.corr, self.rdms = geometry.pairwise_rsa(beta_roi_list, rdm_metric='cosine', pairwise_metric='spearman')
+        self.ror_idx_map = {self.roi_names[idx.item()]: i for i, idx in enumerate(self.idx_roi_map)}
+        self.stim_frames = stim_frames
+        self.generations = generations
+        self.population = population
+        self.sparcity = sparsity
+        self.max_iter = max_iter
+        self.num_nodes = len(self.ror_idx_map)
+        self.reverb_model = models.ElegantReverbNetwork(num_nodes=self.num_nodes,
+                                                        node_shape=(1, 3, spatial, spatial),
+                                                        edge_module=modules.ElegantWeightedConvolution,
+                                                        inject_noise=True,
+                                                        track_activation_history=True,
+                                                        device=device)
+        self.corr = self.corr.to(device)
+        self.rdms = self.rdms.to(device)
+
+    def beta_correlation(self, run_list, verbose=True):
+        # this design matrix holds for all parallel stimuli in batch this epoch
+        design_matrix = torch.nn.functional.one_hot(run_list, num_classes=len(self.feature_names)).float().to(
+            self.device)
+        # compute beta matrix from network activity, compute rdms on matrix, compare to brain rdms
+        time_course = torch.stack(self.reverb_model.past_states, dim=0)[:, 1:].clone()  # ignore stim node
+        time_course = time_course.view(len(design_matrix), self.num_nodes, -1).transpose(0, 1) # node x t x spatial
+        dm_base = (torch.inverse(design_matrix.T @ design_matrix) @ design_matrix.T).unsqueeze(0)  # feature x t
+        betas = torch.matmul(dm_base, time_course)
+        betas = betas.transpose(1, 2)
+        model_corr, model_rdms = geometry.pairwise_rsa(betas, rdm_metric='dot', pairwise_metric='pearson')
+        rdm_corr_obj = util.pearson_correlation(model_rdms, self.rdms, dim=1)
+        rdm_corr_obj = torch.mean(rdm_corr_obj)
+        structural_obj = util.pearson_correlation(model_corr, self.corr)
+        loss = rdm_corr_obj + structural_obj
+        if verbose:
+            print("SL: computed model beta coefficients and pairwise rdms")
+            print("mean RDM correlation:", rdm_corr_obj.detach().cpu().item())
+            print("structural correlation:", structural_obj.detach().cpu().item())
+        return loss
+
+    def fit(self, lr=.0001, verbose=True):
+        optimizer = torch.optim.Adam(lr=lr, params=self.reverb_model.parameters())
+        epoch_history = []
+        epoch = 0
+        while not util.is_converged(epoch_history, abs_tol=.001, consider=100) and epoch < self.max_iter:
+            epoch += 1
+            batch, cond_list = self.stim_gen.get_batch()
+            self.reverb_model.detach()
+            optimizer.zero_grad()
+            runlist = []
+            for idx, stim in enumerate(batch):
+                stim = stim.to(self.device)
+                for i in range(self.stim_frames):
+                    runlist.append(cond_list[idx])
+                    self.reverb_model.forward(stim.unsqueeze(0))
+            loss = self.beta_correlation(torch.Tensor(runlist).long(), verbose=verbose)
+            l1 = self.sparcity * self.reverb_model.l1()
+            print("edge weight l1:", l1.detach().cpu().item())
+            # the correlation portion of the loss must be negated
+            loss = -1 * loss + l1
+            epoch_history.append(loss.detach().cpu().item())
+            if verbose:
+                print("Epoch", epoch)
+                # flush the buffer every 10 epoch so we get some update
+                # this forces process comm. so slow things up if we do too often
+                if (epoch % 10) == 0:
+                    sys.stdout.flush()
+            loss.backward()
+            optimizer.step()
+        return epoch_history
+
+
 class FuzzyMental:
 
     def __init__(self, target_beta_matrix, feature_names, atlas, roi_names: dict, feature_generator, spatial, input_roi,

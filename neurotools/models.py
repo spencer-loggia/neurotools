@@ -1,9 +1,53 @@
 import copy
-
 import numpy as np
 import torch
-from neurotools.modules import Reverb, WeightedConvolution
+from neurotools.modules import Reverb, WeightedConvolution, ElegantWeightedConvolution
 import networkx as nx
+
+
+class ElegantReverbNetwork(torch.nn.Module):
+    """
+    A class intended to replace the old reverb network with more elegance (and better parallelization). It should run
+    much faster with a few drawbacks.
+    """
+    def __init__(self, num_nodes, node_shape: tuple = (1, 3, 64, 64), inject_noise=False,
+                 edge_module=ElegantWeightedConvolution, device='cpu', track_activation_history=False):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.states = torch.zeros(size=(self.num_nodes + 1, node_shape[1], node_shape[2], node_shape[3]))
+        # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
+        self.edge = edge_module(self.num_nodes + 1, node_shape[2], node_shape[3], kernel_size=4, in_channels=node_shape[1],
+                                out_channels=node_shape[1], device=device)
+        self.inject_noise = inject_noise
+        self.sigmoid = torch.nn.Sigmoid()
+        if track_activation_history:
+            self.past_states = []
+        else:
+            self.past_states = None
+
+    def forward(self, x):
+        self.states[0] = x
+        activ = self.sigmoid(self.states)
+        future_state = self.edge(activ).clone()
+        self.edge.update(future_state)
+        self.states = future_state
+        if self.past_states is not None:
+            self.past_states.append(self.states.clone())
+
+    def detach(self):
+        self.edge.detach()
+        self.states = torch.zeros_like(self.states)
+        self.past_states = []
+        return self
+
+    def parameters(self, recurse: bool = True):
+        params = self.edge.parameters()
+        return params
+
+    def l1(self):
+        std_edges = self.edge.out_edge / self.edge.out_edge.std()
+        std_edges = std_edges / (self.num_nodes**2)
+        return torch.sum(torch.abs(std_edges))
 
 
 class ReverbNetwork(torch.nn.Module):
@@ -137,13 +181,4 @@ class ReverbNetwork(torch.nn.Module):
         return new_net
 
 
-class ElegantReverbNet:
-    """
-    A class intended to replace the old reverb network with more elegance (and better parallelization)
-    """
-    def __init__(self, structure: nx.DiGraph, node_shape: tuple = (1, 3, 64, 64), input_nodes=(0,),
-                 inject_noise=False, edge_module=Reverb, device='cpu', track_activation_history=False):
-        self.num_nodes = len(structure)
-        self.states = torch.normal(size=(self.num_nodes, node_shape[1], node_shape[2], node_shape[3]), mean=0, std=.2)
-        # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
-        #
+
