@@ -69,7 +69,7 @@ class ElegantFuzzyMental:
             print("structural correlation:", structural_obj.detach().cpu().item())
         return loss
 
-    def fit(self, lr=.0001, verbose=True):
+    def fit(self, lr=.01, verbose=True):
         optimizer = torch.optim.Adam(lr=lr, params=self.reverb_model.parameters())
         epoch_history = []
         epoch = 0

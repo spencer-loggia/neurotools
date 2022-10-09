@@ -180,6 +180,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
                            device=device)  # 6D Tensor.
         self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv))
         self.out_edge = torch.nn.Parameter(torch.normal(size=(num_nodes, num_nodes), mean=0., std=.1, device=device))
+        self.device = device
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -188,6 +189,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
         self.normalize = normalize_conv
 
     def forward(self, x):
+        x = x.to(self.device)
         if len(x.shape) != 4:
             raise ValueError("Input Tensor Must Be 4D, not shape", x.shape)
         if x.shape[0] != self.num_nodes:
