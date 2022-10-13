@@ -15,15 +15,18 @@ class ElegantReverbNetwork(torch.nn.Module):
         super().__init__()
         self.num_nodes = num_nodes
         self.states = torch.zeros(size=(self.num_nodes + 1, node_shape[1], node_shape[2], node_shape[3]))
+        mask = torch.ones((num_nodes + 1, num_nodes + 1), device=device)
+        mask[:, 0] = 0
         # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
         self.edge = edge_module(self.num_nodes + 1, node_shape[2], node_shape[3], kernel_size=4, in_channels=node_shape[1],
-                                out_channels=node_shape[1], device=device)
+                                out_channels=node_shape[1], device=device, mask=mask)
         self.inject_noise = inject_noise
         self.sigmoid = torch.nn.Sigmoid()
         if track_activation_history:
             self.past_states = []
         else:
             self.past_states = None
+        self.device = device
 
     def forward(self, x):
         self.states[0] = x

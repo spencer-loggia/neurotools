@@ -168,7 +168,7 @@ class WeightedConvolution(torch.nn.Module):
 class ElegantWeightedConvolution(torch.nn.Module):
 
     def __init__(self, num_nodes, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu',
-                 normalize_conv=True, **kwargs):
+                 normalize_conv=True, mask=None, **kwargs):
         """
         serves the same purpose as the standard weighted convolution, but designed to operate on a graph all at once.
         should work better if you have hella v/tRAM and you're not expecting a super sparse graph.
@@ -176,10 +176,15 @@ class ElegantWeightedConvolution(torch.nn.Module):
         super().__init__()
         self.num_nodes = num_nodes
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
+        self.mask = mask
         conv = torch.empty((num_nodes, num_nodes, out_channels, in_channels, self.kernel_size, self.kernel_size),
                            device=device)  # 6D Tensor.
-        self.conv = torch.nn.Parameter(torch.nn.init.xavier_normal_(conv))
-        self.out_edge = torch.nn.Parameter(torch.normal(size=(num_nodes, num_nodes), mean=0., std=.1, device=device))
+        conv = torch.nn.init.xavier_normal_(conv)
+        conv = conv * mask.view(num_nodes, num_nodes, 1, 1, 1, 1)
+        self.conv = torch.nn.Parameter(conv)
+        out_edge = torch.normal(size=(num_nodes, num_nodes), mean=0., std=.1, device=device)
+        out_edge = out_edge * mask
+        self.out_edge = torch.nn.Parameter(out_edge)
         self.device = device
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.in_channels = in_channels
@@ -201,10 +206,12 @@ class ElegantWeightedConvolution(torch.nn.Module):
             conv_weight = torch.sigmoid(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
         else:
             conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1)
+        conv_weight = conv_weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1)
         # can't do regular old mat mul cuz don't want to use all n2 weights (just n) for each of n node
         iter_rule = "cus, uvoc -> uvos"
         conv_res = torch.einsum(iter_rule, xufld, conv_weight) # nodes, nodes, out_channels, spatial1 * spatial,
-        conv_res = conv_res * self.out_edge[:, :, None, None] # weight by out edge
+        masked_outedge = (self.out_edge * self.mask)[:, :, None, None]
+        conv_res = conv_res * masked_outedge  # weight by out edge
         conv_res = conv_res.mean(dim=0).view(self.num_nodes, self.out_channels, self.spatial1, self.spatial2)  # mean over the incoming edges, reshape spatial dims
         return conv_res
 
