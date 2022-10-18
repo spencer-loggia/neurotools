@@ -168,7 +168,7 @@ class WeightedConvolution(torch.nn.Module):
 class ElegantWeightedConvolution(torch.nn.Module):
 
     def __init__(self, num_nodes, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu',
-                 normalize_conv=True, mask=None, **kwargs):
+                 normalize_conv=True, inject_noise=True, mask=None, **kwargs):
         """
         serves the same purpose as the standard weighted convolution, but designed to operate on a graph all at once.
         should work better if you have hella v/tRAM and you're not expecting a super sparse graph.
@@ -180,7 +180,6 @@ class ElegantWeightedConvolution(torch.nn.Module):
         conv = torch.empty((num_nodes, num_nodes, out_channels, in_channels, self.kernel_size, self.kernel_size),
                            device=device)  # 6D Tensor.
         conv = torch.nn.init.xavier_normal_(conv)
-        conv = conv * mask.view(num_nodes, num_nodes, 1, 1, 1, 1)
         self.conv = torch.nn.Parameter(conv)
         out_edge = torch.normal(size=(num_nodes, num_nodes), mean=0., std=.1, device=device)
         out_edge = out_edge * mask
@@ -189,9 +188,11 @@ class ElegantWeightedConvolution(torch.nn.Module):
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.softmax = torch.nn.Softmax(dim=3)
         self.spatial1 = spatial1
         self.spatial2 = spatial2
         self.normalize = normalize_conv
+        self.inject_noise = inject_noise
 
     def forward(self, x):
         x = x.to(self.device)
@@ -202,10 +203,13 @@ class ElegantWeightedConvolution(torch.nn.Module):
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(0, 1)  # channels * kernel * kernel, nodes, spatial1 * spatial2
-        if self.normalize:
-            conv_weight = torch.sigmoid(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
+        if self.inject_noise:
+            noise = torch.normal(size=self.conv.shape, std=.001, mean=0, device=self.device)
         else:
-            conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1)
+            noise = 0
+        conv_weight = torch.abs((self.conv.clone() + noise).view(self.num_nodes, self.num_nodes, self.out_channels, -1))
+        if self.normalize:
+            conv_weight = self.softmax(conv_weight) # nodes, nodes, out_channels, inchannels * kernel * kernel
         conv_weight = conv_weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1)
         # can't do regular old mat mul cuz don't want to use all n2 weights (just n) for each of n node
         iter_rule = "cus, uvoc -> uvos"
