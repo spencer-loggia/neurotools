@@ -36,7 +36,7 @@ class Reverb(torch.nn.Module):
         self.folder = torch.nn.Fold(kernel_size=self.kernel_size,
                                     output_size=(spatial1, spatial2),
                                     padding=self.pad)
-        self.weight = self.unfolder(folded_weight)
+        self.weight = self.unfolder(folded_weight)  # 1, channel * kernel * kernel, spatial * spatial
         self.activation_memory = None  # store unfolded most recent activation
         self.device = 'cpu'
 
@@ -104,9 +104,109 @@ class Reverb(torch.nn.Module):
 
 
 class ElegantReverb:
-    # TODO: add this when I find time, the Reverb edge module is really more of a hobby than real work lol
-    def __init__(self):
-        raise NotImplementedError
+
+    def __init__(self, num_nodes, spatial1, spatial2, kernel_size, channels, device='cpu',
+                 normalize_conv=True, mask=None, **kwargs):
+        """
+        serves the same purpose as the standard reverb convolution, but designed to operate on a graph all at once.
+
+        """
+        super().__init__()
+        self.activation_memory = None
+        self.num_nodes = num_nodes
+        self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
+        self.mask = mask
+
+        # Non-Parametric Weights used for intrinsic update
+        weight = torch.empty((num_nodes, num_nodes,
+                              spatial1, spatial2,
+                              channels, self.kernel_size, self.kernel_size),
+                             device=device)  # 8D Tensor.
+        self.weight = torch.nn.init.xavier_normal_(weight)
+
+        # Parametric Weight used for default receptive field
+        prior = torch.empty((num_nodes, num_nodes, channels, self.kernel_size, self.kernel_size), device=device)
+        self.prior = torch.nn.Parameter(torch.nn.init.xavier_normal_(prior))
+
+        # Channel Mapping
+        chan_map = torch.empty((num_nodes, num_nodes, channels, channels), device=device)
+        self.chan_map = torch.nn.Parameter(torch.nn.init.xavier_normal_(chan_map))
+
+        if "init_plasticity" in kwargs:
+            init_plasticity = kwargs["init_plasticity"]
+        else:
+            init_plasticity = .1
+        self.plasticity = torch.nn.Parameter(torch.ones((num_nodes, num_nodes), device=device) * init_plasticity)
+        self.device = device
+        self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
+        self.folder = torch.nn.Fold(kernel_size=self.kernel_size,
+                                    output_size=(spatial1, spatial2),
+                                    padding=self.pad)
+        self.channels = channels
+        self.spatial1 = spatial1
+        self.spatial2 = spatial2
+        self.normalize = normalize_conv
+
+    def forward(self, x):
+        x = x.to(self.device)  # nodes, channels, spatial1, spatial2
+        if len(x.shape) != 4:
+            raise ValueError("Input Tensor Must Be 4D, not shape", x.shape)
+        if x.shape[0] != self.num_nodes:
+            raise ValueError("Input Tensor must have number of nodes on batch dimension.")
+        if torch.max(x) > 1 or torch.min(x) < 0:
+            print("WARN: Reverb  input activations are expected to have range 0 to 1")
+        xufld = self.unfolder(x).transpose(1, 2)  # nodes, spatial1 * spatial2, channels * kernel * kernel
+        xufld = xufld.view((1, self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size**2, self.channels))
+        xufld = xufld.transpose(4, 5) # need to consider the alignment of the channels and kernels on the last dim
+
+        conv_weight = self.weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1)
+        prior_weight = self.prior * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
+
+        combined_weight = conv_weight + prior_weight.unsqueeze((2, 3))  # broadcast along spatial 1 and 2
+        combined_weight = combined_weight.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels, self.kernel_size**2))
+        meta_state = combined_weight * xufld
+
+        self.activation_memory = meta_state.clone()
+
+        iter_rule = "uvsck, uvco -> uvsok"
+        mapped_meta = torch.einsum(iter_rule, meta_state, self.chan_map)
+
+        mapped_meta = mapped_meta * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
+
+        ufld_meta = torch.sum(mapped_meta, dim=0) # sum over input nodes
+        ufld_meta = ufld_meta.transpose(2, 3) # switch the ordering of kernels and channels to original so we can take the correct view on them
+        ufld_meta = ufld_meta.view((self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size**2 * self.channels)).transpose(1, 2) # finish returning to original unfolded dims
+        out = self.folder(ufld_meta) # nodes, channels, spatial, spatial
+        return out
+
+    def get_weight(self):
+        return self.out_edge
+
+    def update(self, target_activation):
+        """
+        intrinsic update
+        :param target_activation: the activation of each state after forward pass. (nodes, channel, spatial, spatial)
+        :param args:
+        :return:
+        """
+        if len(target_activation.shape) != 4:
+            raise ValueError("Input Tensor Must Be 4D, not shape", target_activation.shape)
+        if target_activation.shape[0] != self.num_nodes:
+            raise ValueError("Input Tensor must have number of nodes on batch dimension.")
+        if torch.max(target_activation) > 1 or torch.min(target_activation) < 0:
+            print("WARN: Reverb  input activations are expected to have range 0 to 1")
+
+        # TODO: Need to back-trace the conv_map
+        # TODO: IMpliment update
+
+    def detach(self):
+        return self
+
+    def to(self, device):
+        self.conv = torch.nn.Parameter(self.conv.to(device))
+        self.out_edge = torch.nn.Parameter(self.out_edge.to(device))
+        self.device = device
+        return self
 
 
 class WeightedConvolution(torch.nn.Module):
@@ -137,8 +237,9 @@ class WeightedConvolution(torch.nn.Module):
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
 
         # unfold x to synaptic space
-        xufld = self.unfolder(x).transpose(1, 2) # 1, spatial1 * spatial2, channels * kernel * kernel
-        conv_weight = torch.abs(self.conv.clone()).view(self.conv.size(0), -1).t() # kernel * kernel * inchannels, out_channels
+        xufld = self.unfolder(x).transpose(1, 2)  # 1, spatial1 * spatial2, channels * kernel * kernel
+        conv_weight = torch.abs(self.conv.clone()).view(self.conv.size(0),
+                                                        -1).t()  # kernel * kernel * inchannels, out_channels
         conv_res = (xufld @ conv_weight).transpose(1, 2)  # 1, out_channels, spatial1 * spatial2
         conv_res = conv_res.view(-1, self.out_channel, self.spatial1, self.spatial2)
         # conv res is standardized so weight comes from edge
@@ -203,16 +304,18 @@ class ElegantWeightedConvolution(torch.nn.Module):
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(0, 1)  # channels * kernel * kernel, nodes, spatial1 * spatial2
         if self.normalize:
-            conv_weight = torch.sigmoid(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1) # nodes, nodes, out_channels, inchannels * kernel * kernel
+            conv_weight = torch.sigmoid(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels,
+                                                                -1)  # nodes, nodes, out_channels, inchannels * kernel * kernel
         else:
             conv_weight = torch.abs(self.conv.clone()).view(self.num_nodes, self.num_nodes, self.out_channels, -1)
         conv_weight = conv_weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1)
         # can't do regular old mat mul cuz don't want to use all n2 weights (just n) for each of n node
         iter_rule = "cus, uvoc -> uvos"
-        conv_res = torch.einsum(iter_rule, xufld, conv_weight) # nodes, nodes, out_channels, spatial1 * spatial,
+        conv_res = torch.einsum(iter_rule, xufld, conv_weight)  # nodes, nodes, out_channels, spatial1 * spatial,
         masked_outedge = (self.out_edge * self.mask)[:, :, None, None]
         conv_res = conv_res * masked_outedge  # weight by out edge
-        conv_res = conv_res.mean(dim=0).view(self.num_nodes, self.out_channels, self.spatial1, self.spatial2)  # mean over the incoming edges, reshape spatial dims
+        conv_res = conv_res.mean(dim=0).view(self.num_nodes, self.out_channels, self.spatial1,
+                                             self.spatial2)  # mean over the incoming edges, reshape spatial dims
         return conv_res
 
     def get_weight(self):
@@ -252,7 +355,3 @@ class ResistiveTensor(torch.nn.Module):
         new_rt.equilibrium = self.equilibrium.clone()
         new_rt.resistivity = torch.nn.Parameter(self.resistivity.clone())
         return new_rt
-
-
-
-
