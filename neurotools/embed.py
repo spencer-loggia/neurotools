@@ -139,7 +139,7 @@ class SupervisedEmbed:
     def feature_ln(self, comp, degree):
         return torch.sum(torch.pow(torch.abs(comp), degree), dim=0).mean()
 
-    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01):
+    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01, degree=2.):
         """
         :param converge_var:
         :param verbose:
@@ -157,7 +157,7 @@ class SupervisedEmbed:
         self.mags = torch.nn.Parameter(torch.ones(1, self.n_components)).to(self.device)
         cur_iter = 0
         history = []
-        optimizer = torch.optim.AdamW(lr=.1, params=[self.components])
+        optimizer = torch.optim.AdamW(lr=.01, params=[self.components])
         while not util.is_converged(history, abs_tol=converge_var):
             if cur_iter >= max_iter:
                 print("WARNING: Failed to converge in", max_iter, "iterations. Could be a solution was found, but the "
@@ -176,8 +176,9 @@ class SupervisedEmbed:
                 loss += var
             loss = (loss / len(unique_targets)) * self.intra_weight
             centers = torch.stack(centers, dim=0)
-            space = torch.pdist(centers)
-            space = space.mean()
+            space = torch.pow(torch.pdist(centers), degree) # we care more about spreading out things that are easy to spread
+            space = torch.pow(space.mean(), (1/degree))
+
             loss = loss - (self.inter_weight * space)
             loss = loss + self.sparsity * self.feature_ln(std_components, 1.00)
             norm_embed = embed / torch.linalg.norm(embed, dim=0)

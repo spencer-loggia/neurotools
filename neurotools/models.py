@@ -1,7 +1,7 @@
 import copy
 import numpy as np
 import torch
-from neurotools.modules import Reverb, WeightedConvolution, ElegantWeightedConvolution
+from neurotools.modules import Reverb, WeightedConvolution, ElegantWeightedConvolution, ElegantReverb
 import networkx as nx
 
 

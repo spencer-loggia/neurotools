@@ -103,7 +103,7 @@ class Reverb(torch.nn.Module):
         self.weight = self.weight.view(weight_shape)
 
 
-class ElegantReverb:
+class ElegantReverb(torch.nn.Module):
 
     def __init__(self, num_nodes, spatial1, spatial2, kernel_size, channels, device='cpu',
                  normalize_conv=True, mask=None, **kwargs):
@@ -115,6 +115,9 @@ class ElegantReverb:
         self.activation_memory = None
         self.num_nodes = num_nodes
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
+        if mask is None:
+            mask = torch.ones((num_nodes, num_nodes), device=device)
+            mask[:, 0] = 0
         self.mask = mask
 
         # Non-Parametric Weights used for intrinsic update
@@ -156,27 +159,31 @@ class ElegantReverb:
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(1, 2)  # nodes, spatial1 * spatial2, channels * kernel * kernel
-        xufld = xufld.view((1, self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size**2, self.channels))
-        xufld = xufld.transpose(4, 5) # need to consider the alignment of the channels and kernels on the last dim
+        xufld = xufld.view((1, self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size ** 2, self.channels))
+        xufld = xufld.transpose(3, 4)  # need to consider the alignment of the channels and kernels on the last dim
+
+        self.activation_memory = xufld.clone()
 
         conv_weight = self.weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1)
         prior_weight = self.prior * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
 
-        combined_weight = conv_weight + prior_weight.unsqueeze((2, 3))  # broadcast along spatial 1 and 2
-        combined_weight = combined_weight.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels, self.kernel_size**2))
+        combined_weight = conv_weight + prior_weight[:, :, None, None, :, :, :]  # broadcast along spatial 1 and 2
+        combined_weight = combined_weight.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2,
+                                                self.kernel_size ** 2, self.channels)).transpose(3, 4)
         meta_state = combined_weight * xufld
-
-        self.activation_memory = meta_state.clone()
 
         iter_rule = "uvsck, uvco -> uvsok"
         mapped_meta = torch.einsum(iter_rule, meta_state, self.chan_map)
 
         mapped_meta = mapped_meta * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
 
-        ufld_meta = torch.sum(mapped_meta, dim=0) # sum over input nodes
-        ufld_meta = ufld_meta.transpose(2, 3) # switch the ordering of kernels and channels to original so we can take the correct view on them
-        ufld_meta = ufld_meta.view((self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size**2 * self.channels)).transpose(1, 2) # finish returning to original unfolded dims
-        out = self.folder(ufld_meta) # nodes, channels, spatial, spatial
+        ufld_meta = torch.sum(mapped_meta, dim=0)  # sum over input nodes
+        ufld_meta = ufld_meta.transpose(2,
+                                        3)  # switch the ordering of kernels and channels to original so we can take the correct view on them
+        ufld_meta = ufld_meta.reshape(
+            (self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size ** 2 * self.channels)).transpose(1,
+                                                                                                              2)  # finish returning to original unfolded dims
+        out = self.folder(ufld_meta)  # nodes, channels, spatial, spatial
         return out
 
     def get_weight(self):
@@ -196,15 +203,45 @@ class ElegantReverb:
         if torch.max(target_activation) > 1 or torch.min(target_activation) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
 
-        # TODO: Need to back-trace the conv_map
-        # TODO: IMpliment update
+        # shape of chanel view of synaptic unfolded space
+        # channel_view = (self.kernel_size ** 2, self.in_channels, self.spatial1, self.spatial2)
 
-    def detach(self):
-        return self
+        # reverse the channel mapping so source channels receive information about the targets they actually innervate
+        target_activations = target_activation.view(1, self.num_nodes, self.channels,
+                                                    self.spatial1 * self.spatial2).transpose(2, 3)
+        reverse_conv = self.chan_map.clone().transpose(2, 3)  # (node, node, in_chan, out_chan)
+
+        iter_rule = "uvsc, uvoc -> uvsc"
+        target_meta_activations = torch.einsum(iter_rule, target_activations, reverse_conv).transpose(2,
+                                                                                                      3)  # source, target, channels, spatial
+        target_meta_activations = target_meta_activations.view(self.num_nodes * self.num_nodes, self.channels,
+                                                               self.spatial1, self.spatial2)
+        ufld_target = self.unfolder(target_meta_activations).transpose(1,
+                                                                       2)  # nodes * nodes, spatial1 * spatial2, channels * kernel * kernel
+        ufld_target = ufld_target.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2,
+                                        self.kernel_size * self.kernel_size, self.channels))
+        ufld_target = ufld_target.transpose(3, 4)  # node, node, spatial * spatial, channel, kernel * kernel
+
+        coactivation = 2 * self.activation_memory * ufld_target  # so the 2 factor is so that strong coactivation actually increases the weights.
+
+        plasticity = self.plasticity.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1).clone()
+
+        self.weight = (1 - plasticity) * self.weight + \
+                      plasticity * coactivation.view((self.num_nodes, self.num_nodes,
+                                                      self.spatial1, self.spatial2,
+                                                      self.channels, self.kernel_size, self.kernel_size))
+
+    def detach(self, reset_weight=False):
+        self.weight = self.weight.detach().clone()
+        self.chan_map = self.chan_map.detach().clone()
+        self.prior = self.prior.detach().clone()
+        self.plasticity = self.plasticity.detach().clone()
 
     def to(self, device):
-        self.conv = torch.nn.Parameter(self.conv.to(device))
-        self.out_edge = torch.nn.Parameter(self.out_edge.to(device))
+        self.weight = self.weight.to(device)
+        self.chan_map = torch.nn.Parameter(self.chan_map.to(device))
+        self.plasticity = torch.nn.Parameter(self.plasticity.to(device))
+        self.prior = torch.nn.Parameter(self.prior.to(device))
         self.device = device
         return self
 
@@ -277,6 +314,9 @@ class ElegantWeightedConvolution(torch.nn.Module):
         super().__init__()
         self.num_nodes = num_nodes
         self.kernel_size, self.pad = util.conv_identity_params(in_spatial=spatial1, desired_kernel=kernel_size)
+        if mask is None:
+            mask = torch.ones((num_nodes, num_nodes), device=device)
+            mask[:, 0] = 0
         self.mask = mask
         conv = torch.empty((num_nodes, num_nodes, out_channels, in_channels, self.kernel_size, self.kernel_size),
                            device=device)  # 6D Tensor.
@@ -310,7 +350,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
             noise = 0
         conv_weight = torch.abs((self.conv.clone() + noise).view(self.num_nodes, self.num_nodes, self.out_channels, -1))
         if self.normalize:
-            conv_weight = self.softmax(conv_weight) # nodes, nodes, out_channels, inchannels * kernel * kernel
+            conv_weight = self.softmax(conv_weight)  # nodes, nodes, out_channels, inchannels * kernel * kernel
         conv_weight = conv_weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1)
         # can't do regular old mat mul cuz don't want to use all n2 weights (just n) for each of n node
         iter_rule = "cus, uvoc -> uvos"
