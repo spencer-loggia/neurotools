@@ -41,4 +41,6 @@ class GratingGenerator:
             gratings = self.mem
         if use_cached:
             self.mem = gratings
-        return torch.from_numpy(np.concatenate(gratings, axis=0)).float(), torch.arange(len(self.stim_params))
+        grate = torch.from_numpy(np.concatenate(gratings, axis=0)).float()
+        grate = (grate - grate.mean(dim=(0, 2, 3)).view(1, 3, 1, 1)) / grate.std(dim=(0, 2, 3)).view(1, 3, 1, 1)
+        return grate, torch.arange(len(self.stim_params))

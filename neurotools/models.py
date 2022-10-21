@@ -31,8 +31,8 @@ class ElegantReverbNetwork(torch.nn.Module):
             input_nodes = np.array(input_nodes) + 1 # compensate for added stim node.
             mask[0, np.delete(np.arange(len(mask)), input_nodes)] = 0
         # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
-        self.edge = edge_module(self.num_nodes + 1, node_shape[2], node_shape[3], kernel_size=4, in_channels=node_shape[1],
-                                out_channels=node_shape[1], device=device, mask=mask, inject_noise=inject_noise)
+        self.edge = edge_module(self.num_nodes + 1, node_shape[2], node_shape[3], kernel_size=4, channels=node_shape[1],
+                                device=device, mask=mask, inject_noise=inject_noise)
         self.inject_noise = inject_noise
         self.sigmoid = torch.nn.Sigmoid()
         if track_activation_history:
@@ -44,14 +44,14 @@ class ElegantReverbNetwork(torch.nn.Module):
     def forward(self, x):
         self.states[0] = x
         activ = self.sigmoid(self.states)
+        self.edge.update(activ)
         future_state = self.edge(activ).clone()
-        self.edge.update(future_state)
         self.states = .9 * future_state + (.1 * self.states.clone())
         if self.past_states is not None:
             self.past_states.append(self.states.clone())
 
-    def detach(self):
-        self.edge.detach()
+    def detach(self, reset_intrinsic=False):
+        self.edge.detach(reset_weight=reset_intrinsic)
         self.states = torch.zeros_like(self.states)
         self.past_states = []
         return self

@@ -159,8 +159,7 @@ class ElegantReverb(torch.nn.Module):
         if torch.max(x) > 1 or torch.min(x) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(1, 2)  # nodes, spatial1 * spatial2, channels * kernel * kernel
-        xufld = xufld.view((1, self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size ** 2, self.channels))
-        xufld = xufld.transpose(3, 4)  # need to consider the alignment of the channels and kernels on the last dim
+        xufld = xufld.view((1, self.num_nodes, self.spatial1 * self.spatial2, self.channels, self.kernel_size ** 2))
 
         self.activation_memory = xufld.clone()
 
@@ -168,8 +167,8 @@ class ElegantReverb(torch.nn.Module):
         prior_weight = self.prior * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
 
         combined_weight = conv_weight + prior_weight[:, :, None, None, :, :, :]  # broadcast along spatial 1 and 2
-        combined_weight = combined_weight.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2,
-                                                self.kernel_size ** 2, self.channels)).transpose(3, 4)
+        combined_weight = combined_weight.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels,
+                                                self.kernel_size ** 2))
         meta_state = combined_weight * xufld
 
         iter_rule = "uvsck, uvco -> uvsok"
@@ -202,6 +201,8 @@ class ElegantReverb(torch.nn.Module):
             raise ValueError("Input Tensor must have number of nodes on batch dimension.")
         if torch.max(target_activation) > 1 or torch.min(target_activation) < 0:
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
+        if self.activation_memory is None:
+            return
 
         # shape of chanel view of synaptic unfolded space
         # channel_view = (self.kernel_size ** 2, self.in_channels, self.spatial1, self.spatial2)
@@ -218,9 +219,8 @@ class ElegantReverb(torch.nn.Module):
                                                                self.spatial1, self.spatial2)
         ufld_target = self.unfolder(target_meta_activations).transpose(1,
                                                                        2)  # nodes * nodes, spatial1 * spatial2, channels * kernel * kernel
-        ufld_target = ufld_target.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2,
-                                        self.kernel_size * self.kernel_size, self.channels))
-        ufld_target = ufld_target.transpose(3, 4)  # node, node, spatial * spatial, channel, kernel * kernel
+        ufld_target = ufld_target.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels,
+                                        self.kernel_size * self.kernel_size))
 
         coactivation = 2 * self.activation_memory * ufld_target  # so the 2 factor is so that strong coactivation actually increases the weights.
 
@@ -232,10 +232,15 @@ class ElegantReverb(torch.nn.Module):
                                                       self.channels, self.kernel_size, self.kernel_size))
 
     def detach(self, reset_weight=False):
-        self.weight = self.weight.detach().clone()
-        self.chan_map = self.chan_map.detach().clone()
-        self.prior = self.prior.detach().clone()
-        self.plasticity = self.plasticity.detach().clone()
+        if reset_weight:
+            weight = torch.empty_like(self.weight, device=self.device)
+            self.weight = torch.nn.init.xavier_normal_(weight)
+        else:
+            self.weight = self.weight.detach().clone()
+        self.chan_map = torch.nn.Parameter(self.chan_map.detach())
+        self.activation_memory = None
+        self.prior = torch.nn.Parameter(self.prior.detach())
+        self.plasticity = torch.nn.Parameter(self.plasticity.detach())
 
     def to(self, device):
         self.weight = self.weight.to(device)
@@ -305,7 +310,7 @@ class WeightedConvolution(torch.nn.Module):
 
 class ElegantWeightedConvolution(torch.nn.Module):
 
-    def __init__(self, num_nodes, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu',
+    def __init__(self, num_nodes, spatial1, spatial2, kernel_size, channels, device='cpu',
                  normalize_conv=True, inject_noise=True, mask=None, **kwargs):
         """
         serves the same purpose as the standard weighted convolution, but designed to operate on a graph all at once.
@@ -318,7 +323,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
             mask = torch.ones((num_nodes, num_nodes), device=device)
             mask[:, 0] = 0
         self.mask = mask
-        conv = torch.empty((num_nodes, num_nodes, out_channels, in_channels, self.kernel_size, self.kernel_size),
+        conv = torch.empty((num_nodes, num_nodes, channels, channels, self.kernel_size, self.kernel_size),
                            device=device)  # 6D Tensor.
         conv = torch.nn.init.xavier_normal_(conv)
         self.conv = torch.nn.Parameter(conv)
@@ -327,8 +332,8 @@ class ElegantWeightedConvolution(torch.nn.Module):
         self.out_edge = torch.nn.Parameter(out_edge)
         self.device = device
         self.unfolder = torch.nn.Unfold(kernel_size=self.kernel_size, padding=self.pad)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.in_channels = channels
+        self.out_channels = channels
         self.softmax = torch.nn.Softmax(dim=3)
         self.spatial1 = spatial1
         self.spatial2 = spatial2
@@ -370,7 +375,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
         """
         pass
 
-    def detach(self):
+    def detach(self, **kwargs):
         return self
 
     def to(self, device):
