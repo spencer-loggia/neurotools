@@ -217,8 +217,7 @@ class ElegantReverb(torch.nn.Module):
                                                                                                       3)  # source, target, channels, spatial
         target_meta_activations = target_meta_activations.view(self.num_nodes * self.num_nodes, self.channels,
                                                                self.spatial1, self.spatial2)
-        ufld_target = self.unfolder(target_meta_activations).transpose(1,
-                                                                       2)  # nodes * nodes, spatial1 * spatial2, channels * kernel * kernel
+        ufld_target = self.unfolder(target_meta_activations).transpose(1, 2)  # nodes * nodes, spatial1 * spatial2, channels * kernel * kernel
         ufld_target = ufld_target.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels,
                                         self.kernel_size * self.kernel_size))
 
