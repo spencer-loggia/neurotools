@@ -17,8 +17,13 @@ def test_elegant_dcgn():
     dcgn = environments.ElegantFuzzyMental(betas, ["condition1", "condition2", "condition3"], atlas=atlas,
                                            roi_names={1: "node1", 2: "node2", 3: "node3", 4: "node4"},
                                            feature_generator=stim_gen, spatial=32,
+<<<<<<< HEAD
                                            stim_frames=6, max_iter=2000, device='cuda', sparsity=1.0)
     dcgn.fit()
+=======
+                                           stim_frames=6, max_iter=2000, device='cuda', sparsity=0.1, input_nodes=(1, ))
+    dcgn.fit(lr=.00001)
+>>>>>>> c7fd0bfff18a6dd7b851b5a7d45848fe89c06df3
     print(dcgn.reverb_model.edge.out_edge.squeeze().detach())
 
 

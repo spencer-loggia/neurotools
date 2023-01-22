@@ -27,5 +27,15 @@ def test_einsum_solution_simple():
     out = mod(states).flatten().detach().tolist()
     assert False not in [out[i] == r for i, r in enumerate([2, 3])]
 
+
+def test_elegent_reverb():
+    states = torch.sigmoid(torch.normal(mean=0, std=.5, size=(4, 2, 16, 16)))
+    mod = modules.ElegantReverb(channels=2, spatial1=16, spatial2=16, kernel_size=4, num_nodes=4)
+    out = mod(states)
+    next_activ = torch.sigmoid(out)
+    mod.update(next_activ)
+    print('done')
+
+
 if __name__=='__main__':
     test_einsum_solution_simple()

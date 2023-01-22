@@ -79,8 +79,8 @@ class MDScale:
         cur_iter = 0
         while not util.is_converged(history, abs_tol=tol):
             if cur_iter >= max_iter:
-                print("WARNING: Failed to converge in", max_iter, "iterations. "
-                                                                  "Could be a solution was found, but the convergence tracker is dumb, just be careful!.")
+                print("WARNING: Failed to converge in", max_iter, "iterations. Could be a solution was found, but the "
+                                                                  "convergence tracker is dumb, just be careful!.")
                 break
             optimizer.zero_grad()
             loss = self.stress(dist_vec, embedding)
@@ -139,7 +139,7 @@ class SupervisedEmbed:
     def feature_ln(self, comp, degree):
         return torch.sum(torch.pow(torch.abs(comp), degree), dim=0).mean()
 
-    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01):
+    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01, degree=2.):
         """
         :param converge_var:
         :param verbose:
@@ -153,18 +153,19 @@ class SupervisedEmbed:
         y = y.to(self.device)
         unique_targets = torch.unique(y)
         self.components = torch.empty((n_features, self.n_components))
-        self.components = torch.nn.Parameter(2 * torch.nn.init.xavier_normal_(self.components).to(self.device))
+        self.components = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.components).to(self.device))
+        self.mags = torch.nn.Parameter(torch.ones(1, self.n_components)).to(self.device)
         cur_iter = 0
         history = []
-        optimizer = torch.optim.Adam(lr=.01, params=[self.components])
+        optimizer = torch.optim.AdamW(lr=.01, params=[self.components])
         while not util.is_converged(history, abs_tol=converge_var):
             if cur_iter >= max_iter:
-                print("WARNING: Failed to converge in", max_iter, "iterations. "
-                                                                  "Could be a solution was found, but the convergence tracker is dumb, just be careful!.")
+                print("WARNING: Failed to converge in", max_iter, "iterations. Could be a solution was found, but the "
+                                                                  "convergence tracker is dumb, just be careful!.")
                 break
             optimizer.zero_grad()
-            std_components = self.get_components()
-            embed = X @ std_components
+            std_components = self.get_norm_components()
+            embed = X @ self.components
             centers = []
             loss = torch.zeros((1,)).to(self.device)
             for t in unique_targets:
@@ -175,11 +176,13 @@ class SupervisedEmbed:
                 loss += var
             loss = (loss / len(unique_targets)) * self.intra_weight
             centers = torch.stack(centers, dim=0)
-            space = torch.pdist(centers)
-            space = space.mean()
+            space = torch.pow(torch.pdist(centers), degree) # we care more about spreading out things that are easy to spread
+            space = torch.pow(space.mean(), (1/degree))
+
             loss = loss - (self.inter_weight * space)
-            loss = loss + self.sparsity * self.feature_ln(std_components, 1.0)
-            orthogonality_loss = torch.abs(std_components.T @ std_components).mean()
+            loss = loss + self.sparsity * self.feature_ln(std_components, 1.00)
+            norm_embed = embed / torch.linalg.norm(embed, dim=0)
+            orthogonality_loss = torch.abs(norm_embed.T @ norm_embed).mean()
             loss = loss + orthogonality_loss
             if torch.isnan(loss):
                 raise ValueError("SL: numerical instability, loss is non-finite. Try again. "
@@ -192,15 +195,12 @@ class SupervisedEmbed:
             cur_iter += 1
         print("done in", cur_iter, "iterations")
 
-    def get_components(self):
+    def get_norm_components(self):
         if self.components is None:
             print("Must fit first.")
             return
-        std_components = (self.components) / self.components.std(dim=0).unsqueeze(0)
-        std_components = std_components
-        return std_components
+        return self.components / torch.linalg.norm(self.components, dim=0)
 
     def predict(self, X):
-        components = self.get_components()
-        embed = X.cpu() @ components
+        embed = X.cpu() @ self.components
         return embed.detach().cpu()
