@@ -36,10 +36,12 @@ def _dot_pdist(arr: torch.Tensor, normalize=False):
 
 
 def _pearson_pdist(arr: torch.Tensor):
+    arr = arr.squeeze()
     k = arr.shape[1]
     coef = torch.corrcoef(arr)
     indices = torch.triu_indices(k, k, offset=1)
-    return coef[indices[0], indices[1]]
+    coef = coef[indices[0], indices[1]]
+    return coef.unsqueeze(0)
 
 
 def dissimilarity(beta: torch.Tensor, metric='dot'):
