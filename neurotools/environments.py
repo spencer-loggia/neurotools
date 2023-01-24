@@ -249,21 +249,42 @@ class FuzzyMental:
 
 
 class FuzzyRL:
+    """
+    schema
+      (in)
+      |s| --> |a| -- |b| <------------ loss
+                \   /                   |
+                 |c| --> decoder --> selector
+                (out)
+    """
 
-    def __init__(self, feature_names, state_generator, spatial, num_nodes=4, stim_frames=1,
-                 max_iter=1000, input_nodes=(1,), feedback_nodes=(2,), output_nodes=(3,), device='cpu'):
-        self.feature_names = feature_names
+    def __init__(self, state_generator, spatial, num_nodes=4, stim_frames=1,
+                 max_iter=1000, input_node=1, feedback_node=2, output_node=3, device='cpu'):
+        """
+
+        :param state_generator: when polled (given action) returns next state and associated value.
+        :param spatial: spatial dimmensionality, must match state generator resolution
+        :param num_nodes: number of computational graph nodes
+        :param stim_frames: frames of computation per state presentation
+        :param max_iter:
+        :param input_node: node where state is inserted
+        :param feedback_node: node where loss is inserted
+        :param output_node: node that action is decoded from
+        :param device: hardware to use for optimization
+        """
         self.state_generator = state_generator
         self.spatial = spatial
         if self.spatial != state_generator.res:
             raise ValueError("state generator resolution must equal network spatial dimensionality.")
         self.cycles_per_stim = stim_frames
-        self.input_nodes = input_nodes
-        self.feedback_nodes = feedback_nodes
-        self.output_nodes = output_nodes
+        self.input_node = input_node
+        self.feedback_node = feedback_node
+        self.output_node = output_node
         self.device = device
         self.max_iter = max_iter
-        self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=input_nodes, device=self.device)
+        self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=(input_node,), device=self.device)
+
+        # TODO: add linear decoder and a way to get loss into network
 
     def fit(self):
         pass
