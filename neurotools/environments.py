@@ -248,3 +248,22 @@ class FuzzyMental:
             self.reverb_model = pop[best_idx]
 
 
+class FuzzyRL:
+
+    def __init__(self, feature_names, state_generator, spatial, num_nodes=4, stim_frames=1,
+                 max_iter=1000, input_nodes=(1,), feedback_nodes=(2,), output_nodes=(3,), device='cpu'):
+        self.feature_names = feature_names
+        self.state_generator = state_generator
+        self.spatial = spatial
+        if self.spatial != state_generator.res:
+            raise ValueError("state generator resolution must equal network spatial dimensionality.")
+        self.cycles_per_stim = stim_frames
+        self.input_nodes = input_nodes
+        self.feedback_nodes = feedback_nodes
+        self.output_nodes = output_nodes
+        self.device = device
+        self.max_iter = max_iter
+        self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=input_nodes, device=self.device)
+
+    def fit(self):
+        pass
