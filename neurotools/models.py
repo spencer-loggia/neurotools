@@ -11,7 +11,8 @@ class ElegantReverbNetwork(torch.nn.Module):
     much faster with a few drawbacks.
     """
     def __init__(self, num_nodes, node_shape: tuple = (1, 3, 64, 64), inject_noise=True,
-                 edge_module=ElegantWeightedConvolution, device='cpu', track_activation_history=False, input_nodes=(1,)):
+                 edge_module=ElegantWeightedConvolution, device='cpu', track_activation_history=False, input_nodes=(1,),
+                 mask=None):
         """
 
         :param num_nodes:
@@ -25,10 +26,11 @@ class ElegantReverbNetwork(torch.nn.Module):
         super().__init__()
         self.num_nodes = num_nodes
         self.states = torch.zeros(size=(self.num_nodes + 1, node_shape[1], node_shape[2], node_shape[3]), device=device)
-        mask = torch.ones((num_nodes + 1, num_nodes + 1), device=device)
-        mask[:, 0] = 0
+        if mask is None:
+            mask = torch.ones((num_nodes + 1, num_nodes + 1), device=device)
+            mask[:, 0] = 0
         if input_nodes is not None:
-            input_nodes = np.array(input_nodes) + 1 # compensate for added stim node.
+            input_nodes = np.array(input_nodes) + 1  # compensate for added stim node.
             mask[0, np.delete(np.arange(len(mask)), input_nodes)] = 0
         # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
         self.edge = edge_module(self.num_nodes + 1, node_shape[2], node_shape[3], kernel_size=4, channels=node_shape[1],
@@ -45,10 +47,10 @@ class ElegantReverbNetwork(torch.nn.Module):
         self.states[0] = x
         activ = self.sigmoid(self.states)
         self.edge.update(activ)
-        future_state = self.edge(activ).clone()
-        self.states = .9 * future_state + (.1 * self.states.clone())
+        self.states = self.edge(activ).clone()
         if self.past_states is not None:
             self.past_states.append(self.states.clone())
+        return self.states
 
     def detach(self, reset_intrinsic=False):
         self.edge.detach(reset_weight=reset_intrinsic)

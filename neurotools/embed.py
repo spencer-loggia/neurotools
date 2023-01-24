@@ -130,6 +130,7 @@ class SupervisedEmbed:
         self.intra_weight = intra_class_weight
         self.inter_weight = inter_class_weight
 
+
     def to(self, device):
         if self.components is not None:
             self.components = self.components.to(device)
@@ -139,19 +140,23 @@ class SupervisedEmbed:
     def feature_ln(self, comp, degree):
         return torch.sum(torch.pow(torch.abs(comp), degree), dim=0).mean()
 
-    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01, degree=2.):
+    def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01, degree=2., dist_mask=None, bootstrap_iter=100):
         """
         :param converge_var:
         :param verbose:
         :param X: items x features
         :param y: target class
         :param max_iter:
+        :param dist_mask: can order model to not consider separation between certain targets.
         :return:
         """
         n_features = X.shape[1]
         X = X.to(self.device)
         y = y.to(self.device)
         unique_targets = torch.unique(y)
+        if dist_mask is not None:
+            triu = torch.triu_indices(len(unique_targets), len(unique_targets), offset=1)
+            dist_mask = dist_mask[triu[0], triu[1]]
         self.components = torch.empty((n_features, self.n_components))
         self.components = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.components).to(self.device))
         self.mags = torch.nn.Parameter(torch.ones(1, self.n_components)).to(self.device)
@@ -176,9 +181,11 @@ class SupervisedEmbed:
                 loss += var
             loss = (loss / len(unique_targets)) * self.intra_weight
             centers = torch.stack(centers, dim=0)
-            space = torch.pow(torch.pdist(centers), degree) # we care more about spreading out things that are easy to spread
-            space = torch.pow(space.mean(), (1/degree))
-
+            space = torch.pow(torch.pdist(centers), degree)  # we care more about spreading out things that are easy to
+                                                             # spread
+            if dist_mask is not None:
+                space = space * dist_mask
+            space = torch.pow(space.mean(), (1 / degree))
             loss = loss - (self.inter_weight * space)
             loss = loss + self.sparsity * self.feature_ln(std_components, 1.00)
             norm_embed = embed / torch.linalg.norm(embed, dim=0)

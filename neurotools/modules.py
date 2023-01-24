@@ -150,6 +150,10 @@ class ElegantReverb(torch.nn.Module):
         self.spatial2 = spatial2
         self.normalize = normalize_conv
 
+    # def parameters(self, recurse: bool = True):
+    #     params = [self.chan_map, self.plasticity, self.prior]
+    #     return params
+
     def forward(self, x):
         x = x.to(self.device)  # nodes, channels, spatial1, spatial2
         if len(x.shape) != 4:
@@ -177,11 +181,10 @@ class ElegantReverb(torch.nn.Module):
         mapped_meta = mapped_meta * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
 
         ufld_meta = torch.sum(mapped_meta, dim=0)  # sum over input nodes
-        ufld_meta = ufld_meta.transpose(2,
-                                        3)  # switch the ordering of kernels and channels to original so we can take the correct view on them
+        ufld_meta = ufld_meta.transpose(2, 3)  # switch the ordering of kernels and channels to original so we can take the correct view on them
         ufld_meta = ufld_meta.reshape(
-            (self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size ** 2 * self.channels)).transpose(1,
-                                                                                                              2)  # finish returning to original unfolded dims
+            (self.num_nodes, self.spatial1 * self.spatial2, self.kernel_size ** 2 * self.channels)
+        ).transpose(1, 2)  # finish returning to original unfolded dims
         out = self.folder(ufld_meta)  # nodes, channels, spatial, spatial
         return out
 
@@ -207,7 +210,7 @@ class ElegantReverb(torch.nn.Module):
         # shape of chanel view of synaptic unfolded space
         # channel_view = (self.kernel_size ** 2, self.in_channels, self.spatial1, self.spatial2)
 
-        # reverse the channel mapping so source channels receive information about the targets they actually innervate
+        # reverse the channel mapping so source channels receive information about their targets
         target_activations = target_activation.view(1, self.num_nodes, self.channels,
                                                     self.spatial1 * self.spatial2).transpose(2, 3)
         reverse_conv = self.chan_map.clone().transpose(2, 3)  # (node, node, in_chan, out_chan)
