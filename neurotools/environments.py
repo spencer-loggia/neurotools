@@ -1,3 +1,7 @@
+import math
+from itertools import chain
+
+import numpy as np
 import torch
 import sys
 import networkx as nx
@@ -64,10 +68,10 @@ class ElegantFuzzyMental:
         # this design matrix holds for all parallel stimuli in batch this epoch
         design_matrix = torch.nn.functional.one_hot(run_list, num_classes=len(self.feature_names) + 1).float().to(
             self.device)
-        design_matrix = design_matrix[:, 1:] # get rid of base column
+        design_matrix = design_matrix[:, 1:]  # get rid of base column
         # compute beta matrix from network activity, compute rdms on matrix, compare to brain rdms
         time_course = torch.stack(self.reverb_model.past_states, dim=0)[:, 1:].clone()  # ignore stim node
-        time_course = time_course.view(len(design_matrix), self.num_nodes, -1).transpose(0, 1) # node x t x spatial
+        time_course = time_course.view(len(design_matrix), self.num_nodes, -1).transpose(0, 1)  # node x t x spatial
         dm_base = (torch.inverse(design_matrix.T @ design_matrix) @ design_matrix.T).unsqueeze(0)  # feature x t
         betas = torch.matmul(dm_base, time_course)
         betas = betas.transpose(1, 2)
@@ -185,8 +189,8 @@ class FuzzyMental:
                 continue
             time_course = torch.stack(data["_past_states"], dim=1).view(1, len(run_list), -1)  # batch x t x n
             betas = torch.transpose(
-                        torch.inverse(design_matrix.T @ design_matrix) @ design_matrix.T @ time_course,
-                    1, 2)  # batch x n x k
+                torch.inverse(design_matrix.T @ design_matrix) @ design_matrix.T @ time_course,
+                1, 2)  # batch x n x k
             betas = torch.mean(betas, dim=0).unsqueeze(0)  # average out batch dimension
             beta_list.append(betas)
         model_corr, model_rdms = geometry.pairwise_rsa(beta_list, rdm_metric='dot', pairwise_metric='pearson')
@@ -257,13 +261,14 @@ class FuzzyRL:
                  |c| --> decoder --> selector
                 (out)
     """
+    _OUTPUT_DIM = 2
 
     def __init__(self, state_generator, spatial, num_nodes=4, stim_frames=1,
                  max_iter=1000, input_node=1, feedback_node=2, output_node=3, device='cpu'):
         """
-
+        get ouptu angles by cosine distance from output channel 1 - 2 and output channel 2 - 3
         :param state_generator: when polled (given action) returns next state and associated value.
-        :param spatial: spatial dimmensionality, must match state generator resolution
+        :param spatial: spatial dimensionality, must match state generator resolution, must be a power of 2
         :param num_nodes: number of computational graph nodes
         :param stim_frames: frames of computation per state presentation
         :param max_iter:
@@ -273,6 +278,9 @@ class FuzzyRL:
         :param device: hardware to use for optimization
         """
         self.state_generator = state_generator
+        self.min_loss = self.state_generator.min_loss
+        self.max_loss = self.state_generator.max_loss
+        self.chance_loss = self.state_generator.chance_loss
         self.spatial = spatial
         if self.spatial != state_generator.res:
             raise ValueError("state generator resolution must equal network spatial dimensionality.")
@@ -283,8 +291,38 @@ class FuzzyRL:
         self.device = device
         self.max_iter = max_iter
         self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=(input_node,), device=self.device)
+        self.decoder = torch.nn.Parameter(torch.normal(0, .1, size=(self.spatial**2, FuzzyRL._OUTPUT_DIM),
+                                                       device=self.device))
+        self.prev_action = None
+        self.optim = torch.optim.Adam(lr=.001, params=list(self.model.parameters()) + [self.decoder])
 
-        # TODO: add linear decoder and a way to get loss into network
+    def compute_loss_rep(self, log_loss):
+        loss_matrix = np.zeros((self.spatial ** 2))
+        progress = (log_loss - self.min_loss) / (self.max_loss - self.min_loss)
+        bound = torch.floor(progress * (self.spatial ** 2))
+        loss_matrix[:bound] = loss_matrix[:bound] + 1
+        loss_matrix = loss_matrix.reshape(self.spatial, self.spatial)
+        return loss_matrix
+
+    def delta(self):
+        """
+        a single step.
+        :return:
+        """
+        state, loss = self.state_generator.poll(self.prev_action)
+        for i in range(self.cycles_per_stim):
+            self.model.forward(state)
+        action = self.model.states[self.output_node, 2, :, :] @ self.decoder
+        self.prev_action = action
+        return loss
+
+    def learning_fit(self, entropy_curve):
+        """
+        method to make approximate how well model fit matches natural learning.
+        :param entropy_curve:
+        :return:
+        """
+        pass
 
     def fit(self):
         pass

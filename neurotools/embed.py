@@ -130,7 +130,6 @@ class SupervisedEmbed:
         self.intra_weight = intra_class_weight
         self.inter_weight = inter_class_weight
 
-
     def to(self, device):
         if self.components is not None:
             self.components = self.components.to(device)
@@ -159,7 +158,6 @@ class SupervisedEmbed:
             dist_mask = dist_mask[triu[0], triu[1]]
         self.components = torch.empty((n_features, self.n_components))
         self.components = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.components).to(self.device))
-        self.mags = torch.nn.Parameter(torch.ones(1, self.n_components)).to(self.device)
         cur_iter = 0
         history = []
         optimizer = torch.optim.AdamW(lr=.01, params=[self.components])

@@ -32,6 +32,7 @@ class CategoricalDistributor:
         psi = polar[:, 1][:, None]
         psi2 = loci[:, 1][None, :]
         arc = torch.acos(torch.sin(theta)*torch.sin(theta2) + torch.cos(theta) * torch.cos(theta2) * torch.cos(psi - psi2))
+        arc[arc > torch.pi] = 2 * torch.pi - arc[arc > torch.pi]
         return arc
 
 
@@ -94,7 +95,7 @@ class BasicMultiClass:
 
         return image, label.long().to(self.device)
 
-    def poll(self, action):
+    def poll(self, action=None):
         state, label = self.pop()
         if action is None:
             return state, None
