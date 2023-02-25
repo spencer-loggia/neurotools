@@ -1,11 +1,12 @@
 import math
 from itertools import chain
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import sys
 import networkx as nx
-from neurotools import models, geometry, modules, util
+from neurotools import models, geometry, modules, util, generators
 
 
 def _set_mp_env():
@@ -290,11 +291,12 @@ class FuzzyRL:
         self.output_node = output_node
         self.device = device
         self.max_iter = max_iter
-        self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=(input_node,), device=self.device)
+        self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=(input_node,), device=self.device,
+                                                 node_shape=(1, 3, spatial, spatial))
         self.decoder = torch.nn.Parameter(torch.normal(0, .1, size=(self.spatial**2, FuzzyRL._OUTPUT_DIM),
                                                        device=self.device))
         self.prev_action = None
-        self.optim = torch.optim.Adam(lr=.001, params=list(self.model.parameters()) + [self.decoder])
+        self.optim = torch.optim.Adam(lr=.0001, params=list(self.model.parameters()) + [self.decoder] + self.state_generator.selector.loci)
 
     def compute_loss_rep(self, log_loss):
         loss_matrix = np.zeros((self.spatial ** 2))
@@ -304,17 +306,17 @@ class FuzzyRL:
         loss_matrix = loss_matrix.reshape(self.spatial, self.spatial)
         return loss_matrix
 
-    def delta(self):
+    def delta(self, state):
         """
         a single step.
         :return:
         """
-        state, loss = self.state_generator.poll(self.prev_action)
         for i in range(self.cycles_per_stim):
             self.model.forward(state)
-        action = self.model.states[self.output_node, 2, :, :] @ self.decoder
-        self.prev_action = action
-        return loss
+        action = self.model.states[self.output_node, 2, :, :]
+        action = action.reshape(1, self.spatial**2)
+        action = action.clone() @ self.decoder
+        return action
 
     def learning_fit(self, entropy_curve):
         """
@@ -322,7 +324,54 @@ class FuzzyRL:
         :param entropy_curve:
         :return:
         """
-        pass
+        trials = len(entropy_curve)
+        match_loss = torch.sum(entropy_curve * (torch.arange(trials, device=self.device) / trials))
+        chance_loss = torch.sum((torch.abs(entropy_curve - self.chance_loss)) *
+                                (1 - (torch.arange(trials, device=self.device) / trials)))
+        return match_loss + chance_loss
 
-    def fit(self):
-        pass
+    def evolve(self, generations=1000):
+        """
+        :return:
+        """
+        print("Initialize L2L sequence...")
+        plt.ion()
+        fit_progression = []
+        for epoch in range(generations):
+            gen_entropy = []
+            self.optim.zero_grad()
+            self.model.detach(reset_intrinsic=True)
+            for i, data in enumerate(self.state_generator.play(self)):
+                state, loss = data
+                if loss is not None:
+                    gen_entropy.append(loss)
+            gen_entropy = torch.stack(gen_entropy)
+            if epoch % int(generations / 25) == 0:
+                fig, ax = plt.subplots()
+                ax.plot(gen_entropy.detach().cpu().numpy())
+                plt.show(block=False)
+                plt.pause(.001)
+            meta_loss = self.learning_fit(gen_entropy)
+            fit_score = meta_loss.detach().cpu().item()
+            print("gen", epoch, "l2l loss is", fit_score)
+            fit_progression.append(fit_score)
+            meta_loss.backward()
+            self.optim.step()
+        print("l2l sequence completed in", generations, "generations. Plotting fitness progression...")
+        plt.plot(np.array(fit_progression))
+        plt.show()
+
+
+if __name__ == '__main__':
+    import pickle
+    torch.autograd.set_detect_anomaly(True)
+    state_generator = generators.BasicMultiClass(label_min=0, label_max=4, dev='cpu')
+    fzrl_model = FuzzyRL(state_generator, spatial=4, device='cpu')
+    fzrl_model.evolve(generations=1000)
+    with open('../models/fzrl_basic_test.pkl', "wb") as f:
+        pickle.dump(fzrl_model, f)
+
+
+
+
+
