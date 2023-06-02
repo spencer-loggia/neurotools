@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from neurotools import util
 
-
 class Reverb(torch.nn.Module):
 
     def __init__(self, spatial1, spatial2, kernel_size, in_channels, out_channels, device='cpu', **kwargs):

@@ -295,7 +295,6 @@ class FuzzyRL:
                                                  node_shape=(1, 3, spatial, spatial))
         self.decoder = torch.nn.Parameter(torch.normal(0, .1, size=(self.spatial**2, FuzzyRL._OUTPUT_DIM),
                                                        device=self.device))
-        self.prev_action = None
         self.optim = torch.optim.Adam(lr=.0001, params=list(self.model.parameters()) + [self.decoder] + self.state_generator.selector.loci)
 
     def compute_loss_rep(self, log_loss):
@@ -365,7 +364,7 @@ class FuzzyRL:
 if __name__ == '__main__':
     import pickle
     torch.autograd.set_detect_anomaly(True)
-    state_generator = generators.BasicMultiClass(label_min=0, label_max=4, dev='cpu')
+    state_generator = generators.BasicMultiClassRL(label_min=0, label_max=4, dev='cpu')
     fzrl_model = FuzzyRL(state_generator, spatial=4, device='cpu')
     fzrl_model.evolve(generations=1000)
     with open('../models/fzrl_basic_test.pkl', "wb") as f:
