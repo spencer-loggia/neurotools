@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from neurotools import util
 
-_distance_metrics_ = ['euclidian', 'pearson', 'spearman', 'dot', 'cosine']
+_distance_metrics_ = ['euclidian', 'pearson', 'spearman', 'dot', 'cosine' ]
 
 
 def pdist_general(X: torch.Tensor, metric, **kwargs):
@@ -20,17 +20,17 @@ def pdist_general(X: torch.Tensor, metric, **kwargs):
 
 def _dot_pdist(arr: torch.Tensor, normalize=False):
     """
-    arr should be 2D < observations(v) x conditions (k) >
+    arr should be 3D <batch x observations(v) x conditions (k) >
     if normalixe is true, equivilant to pairwise cosine similarity
     :param arr:
     :return:
     """
     if len(arr.shape) == 1:
         arr = arr.reshape(1, arr.shape[0])
-    k = arr.shape[2]
+    k = arr.shape[1]
     if normalize:
         arr = arr / arr.norm(dim=1)[:, None, :]
-    outer = torch.matmul(arr.transpose(-1, -2), arr)  # k x k
+    outer = torch.matmul(arr, arr.transpose(-1, -2))  # k x k
     indices = torch.triu_indices(k, k, offset=1)
     return outer[:, indices[0], indices[1]]
 
@@ -40,7 +40,7 @@ def _pearson_pdist(arr: torch.Tensor):
     k = arr.shape[1]
     coef = torch.corrcoef(arr)
     indices = torch.triu_indices(k, k, offset=1)
-    coef = coef[indices[0], indices[1]]
+    coef = coef[:, indices[0], indices[1]]
     return coef.unsqueeze(0)
 
 
