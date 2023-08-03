@@ -1,10 +1,12 @@
+import copy
+import datetime
 import os
 from typing import Tuple
 
 import numpy as np
 import torch
 from scipy import ndimage
-from torch.multiprocessing import Pool
+import torch.multiprocessing as mp
 from torch.nn.functional import conv3d
 from matplotlib import pyplot as plt
 import pickle as pk
@@ -157,56 +159,64 @@ class GlobalCrossDecoder:
                 pass
 
         self.save("end_epoch_" + str(iters))
+        return local_loss_history, local_acc
 
-    def fit(self, X:list):
+    def fit(self, X:list, iters=1000):
         """
         :param X: a list of dataloaders for each set
         :return:
         """
+        args = []
+        context = mp.get_context("spawn")
         for i in range(self.n_sets):
-            decoder = self.decoders[i]
-            in_mask_base = self.mask_base[i][i]
-            in_optimizer = self.decode_optim[i]
-            in_set = X[i]
-            in_mask = self.get_mask(in_mask_base)
+            args.append((copy.deepcopy(X), i, iters))
+        with context.Pool() as p:
+            res = p.starmap(self._fit, args)
+        for i in range(self.n_sets):
+            for j in range(self.n_sets):
+                self.loss_histories[i][j] += res[i][j]
 
-
-    def compute_saliancy(self, data, use_mask=True):
-        sal_map = torch.zeros(self.spatial)
+    def compute_saliancy(self, X, use_mask=True):
         count = 0
-        for i, (stim, target) in enumerate(data):
-            print("batch", i)
-            self.decode_optim.zero_grad()
-            with torch.no_grad():
-                c_stim = torch.nn.Parameter(torch.from_numpy(stim).float().to(self.device).clone())
-            if use_mask:
-                s_gain = self.get_mask(noise=False)
-            else:
-                s_gain = self.force_mask
-            stim = c_stim * s_gain
-            # s_gain = torch.abs(gain)
-            # c_stim = c_stim * s_gain
-            y_hat = self.decoder(stim)
-            targets = torch.from_numpy(target).long().to(self.device)
-            # compute gradient of correct yhat with respect to pixels
-            correct = torch.argmax(y_hat, dim=1).int() == targets
-            correct_yhat = y_hat[torch.arange(len(y_hat)), targets]
-            loss = torch.sum(correct_yhat * correct)
-            loss.backward()
-            grad_data = c_stim.grad.data
-            # get gradient magnitude
-            over_chan = torch.sum(grad_data, dim=(0, 1))
-            sal = torch.abs(over_chan)
-            sal_map += sal.detach().cpu()
-            count += torch.count_nonzero(correct).cpu()
-        self.decode_optim.zero_grad()
-
-        sal_map = sal_map.numpy()
-        self.sal_map = sal_map
+        sal_map = []
+        for i in range(self.n_sets):
+            sal_map.append([])
+            X_t = copy.deepcopy(X)
+            for j in range(self.n_sets):
+                sal_map[i].append(torch.zeros(self.spatial))
+                data = X_t[j]
+                for i, (stim, target) in enumerate(data):
+                    print("batch", i)
+                    self.decode_optim[i].zero_grad()
+                    with torch.no_grad():
+                        c_stim = torch.nn.Parameter(torch.from_numpy(stim).float().to(self.device).clone())
+                    if use_mask:
+                        s_gain = self.get_mask(self.mask_base[i][j], noise=False)
+                    else:
+                        s_gain = self.force_mask
+                    stim = c_stim * s_gain
+                    # s_gain = torch.abs(gain)
+                    # c_stim = c_stim * s_gain
+                    y_hat = self.decoders[i](stim)
+                    targets = torch.from_numpy(target).long().to(self.device)
+                    # compute gradient of correct yhat with respect to pixels
+                    correct = torch.argmax(y_hat, dim=1).int() == targets
+                    correct_yhat = y_hat[torch.arange(len(y_hat)), targets]
+                    loss = torch.sum(correct_yhat * correct)
+                    loss.backward()
+                    grad_data = c_stim.grad.data
+                    # get gradient magnitude
+                    over_chan = torch.sum(grad_data, dim=(0, 1))
+                    sal = torch.abs(over_chan)
+                    sal_map[i][j] += sal.detach().cpu()
+                    count += torch.count_nonzero(correct).cpu()
+                self.decode_optim[i].zero_grad()
+                sal_map[i][j] = sal_map[i][j].numpy()
+        self.sal_maps = sal_map
         return sal_map
 
     def save(self, tag="temp"):
-        fname = self.name + "_xdecode_" + tag + "_iac:" + str(int(self.in_acc[-1])) + "_xac:" + str(int(self.x_acc[-1])) + ".pkl"
+        fname = self.name + "_xdecode_" + tag + str(datetime.datetime.now().time()) + ".pkl"
         with open(os.path.join(self.save_dir, fname), "wb") as f:
             pk.dump(self, f)
 
