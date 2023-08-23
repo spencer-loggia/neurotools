@@ -3,7 +3,7 @@ import numpy as np
 import networkx as nx
 
 
-def is_converged(loss_history, abs_tol=.00001, consider=1000):
+def is_converged(loss_history, abs_tol=.00001, consider=100):
     """
     A heuristic metric of whether a model has converged
     :param loss_history:
