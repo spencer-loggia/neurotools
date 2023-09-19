@@ -37,7 +37,7 @@ class GlobalCrossDecoder:
     """
 
     def __init__(self, decoders: Tuple[torch.nn.Module], smooth_kernel_size: int, input_spatial: tuple, input_channels: int,
-                 force_mask: torch.Tensor, name: str, n_sets=2, save_dir='.', device="cuda", lr=.01, use_train_mask=False,
+                 force_mask: torch.Tensor, name: str, n_sets=2, device="cuda", lr=.01, use_train_mask=False,
                  unique_masks=True, set_names=("shape", "color")):
         self.decoders = [decoder.to(device) for decoder in decoders]
         self.spatial = input_spatial
@@ -45,12 +45,10 @@ class GlobalCrossDecoder:
         self.smooth_kernel_size = smooth_kernel_size
         self.device = device
         self.force_mask = force_mask.to(self.device).reshape((1, 1) + force_mask.shape)
-        self.save_iter = 250
         self.mask_in_set = use_train_mask
         self.set_names = set_names
         self.n_sets = n_sets
         self.name = name
-        self.save_dir = save_dir
         self.unique_masks = unique_masks
         self.mask_base = [[torch.nn.Parameter(torch.normal(0, .001, size=(1, 1) + self.spatial, device=device)) for
                            _ in range(n_sets)] for _ in range(n_sets)]
@@ -82,9 +80,9 @@ class GlobalCrossDecoder:
     def get_mask(self, mask_base, noise=True):
         # takes -inf, inf input to range 0, 1. Maintains desirable gradient characteristics.
         s_gain = mask_base * self.force_mask
-        s_gain = self.gaussian_smoothing(s_gain, kernel_size=self.smooth_kernel_size)
         s_gain = torch.nn.functional.tanh(s_gain)
         s_gain = torch.pow(s_gain, 2)
+        s_gain = self.gaussian_smoothing(s_gain, kernel_size=self.smooth_kernel_size)
         return s_gain
 
     def decode_step(self, decoder, in_train, mask):
@@ -115,7 +113,7 @@ class GlobalCrossDecoder:
         X = [X[i] for i in range(self.n_sets)]
         in_train = X[in_idx]
         decoder = self.decoder[in_idx]
-        self.sal_map = None
+        self.sal_maps = None
         local_loss_history = [list() for _ in range(self.n_sets)]
         local_acc = [list() for _ in range(self.n_sets)]
 
@@ -125,7 +123,7 @@ class GlobalCrossDecoder:
             else:
                 in_mask = self.force_mask.clone()
             decode_loss, acc = self.decode_step(decoder, in_train, in_mask)
-            l2loss = .25 * torch.mean(
+            l2loss = .22 * torch.mean(
                 torch.stack([torch.mean(torch.pow(param.data.flatten(), 2)) for param in decoder.parameters()]))
             if self.mask_in_set:
                 l1mask_loss = .04 * torch.sum(in_mask)
@@ -147,7 +145,7 @@ class GlobalCrossDecoder:
                 x_optim = self.mask_optim[in_idx][x_idx]
                 x_mask = self.get_mask(self.mask_base[in_idx][x_idx])
                 mask_loss, acc = self.decode_step(decoder, x_train, x_mask)
-                l2loss = .04 * torch.sum(x_mask)
+                # l2loss = .04 * torch.sum(x_mask)
                 local_loss_history[x_idx].append(mask_loss.detach().cpu().item())
                 local_acc[x_idx].append(acc)
                 print(epoch, "CROSS-MODALITY LOSS:", local_loss_history[x_idx][-1], "ACC", acc, "(REG:", l2loss.detach().cpu().item() ,")")
@@ -156,8 +154,6 @@ class GlobalCrossDecoder:
                 x_optim.step()
                 x_optim.zero_grad()
 
-            if ((epoch + 1) % self.save_iter) == 0:
-                self.save(tag="restart_snapshot")
             sys.stdout.flush()
         for dset in X:
             try:
@@ -218,11 +214,6 @@ class GlobalCrossDecoder:
         self.sal_maps = sal_map
         return sal_map
 
-    def save(self, tag="temp"):
-        fname = self.name + "_xdecode_" + tag + str(datetime.datetime.now().time()) + ".pkl"
-        with open(os.path.join(self.save_dir, fname), "wb") as f:
-            pk.dump(self, f)
-
 
 class GlobalMultiStepCrossDecoder:
     """
@@ -240,7 +231,7 @@ class GlobalMultiStepCrossDecoder:
     """
 
     def __init__(self, decoder: Union[torch.nn.Module, tuple], smooth_kernel_size: int, input_spatial: tuple, input_channels: int,
-                 force_mask: torch.Tensor, name: str, n_sets=2, save_dir='.', device="cuda", lr=.01, set_names=("shape", "color")):
+                 force_mask: torch.Tensor, name: str, n_sets=2, device="cuda", lr=.01, set_names=("shape", "color")):
         if isinstance(decoder, torch.nn.Module):
             decoder = [decoder]
             print("Using single decoder for all modalities.")
@@ -256,11 +247,9 @@ class GlobalMultiStepCrossDecoder:
         self.smooth_kernel_size = smooth_kernel_size
         self.device = device
         self.force_mask = force_mask.to(self.device).reshape((1, 1) + force_mask.shape)
-        self.save_iter = 250
         self.set_names = set_names
         self.n_sets = n_sets
         self.name = name
-        self.save_dir = save_dir
         self._reset_mask()
         self.smooth_kernel = self._create_smoothing_kernel(self.smooth_kernel_size)
         self.decode_optim = [torch.optim.Adam(lr=lr, params=d.parameters()) for d in self.decoder]
@@ -328,7 +317,7 @@ class GlobalMultiStepCrossDecoder:
 
     def _fit(self, X, in_idx, iters=1000):
         X = [X[i] for i in range(self.n_sets)]
-        self.sal_map = None
+        self.sal_maps = None
         local_loss_history = [list() for _ in range(self.n_sets)]
         local_acc = [list() for _ in range(self.n_sets)]
         if len(self.decoder) == self.n_sets:
@@ -351,8 +340,6 @@ class GlobalMultiStepCrossDecoder:
                 x_optim.step()
                 x_optim.zero_grad()
 
-            if ((epoch + 1) % self.save_iter) == 0:
-                self.save(tag="restart_snapshot")
             sys.stdout.flush()
         for dset in X:
             closed = False
@@ -406,7 +393,7 @@ class GlobalMultiStepCrossDecoder:
         if reset_mask:
             self._reset_mask()
         for i in range(self.n_sets):
-            X.epochs = (iters // 5) + 1
+            X.epochs = (iters // 4) + 1
             X.resample = False
             local_loss, local_acc = self._fit(X, i, iters=iters)
             for j in range(self.n_sets):
@@ -447,11 +434,6 @@ class GlobalMultiStepCrossDecoder:
                 sal_map[i][j] = sal_map[i][j].numpy()
         self.sal_maps = sal_map
         return sal_map
-
-    def save(self, tag="temp"):
-        fname = self.name + "_xdecode_" + tag + str(datetime.datetime.now().time()) + ".pkl"
-        with open(os.path.join(self.save_dir, fname), "wb") as f:
-            pk.dump(self, f)
 
 
 
