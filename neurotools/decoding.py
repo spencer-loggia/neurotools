@@ -265,8 +265,8 @@ class GlobalMultiStepCrossDecoder:
 
 class SearchlightDecoder:
 
-    def __init__(self, kernel_size, pad=1, stride=1, spatial=(64, 64, 64), n_classes=6, channels=1, lr=.01, reg=.1, device="cpu",
-                 num_layer=3, hidden_channels=3, nonlinear=False, standardization_mode=None, reweight=False):
+    def __init__(self, kernel_size=3, pad=1, stride=1, spatial=(64, 64, 64), n_classes=6, channels=2, lr=.01, reg=.05, device="cuda",
+                 num_layer=3, hidden_channels=2, nonlinear=False, standardization_mode=None, reweight=True):
         """
         Class to fit a layered convolutional searchlight over input data with 2 or 3 spatial dimensions.
         Args:
