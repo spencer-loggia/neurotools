@@ -6,10 +6,12 @@ from typing import Tuple, Union
 import numpy as np
 import torch
 from scipy import ndimage
-from torch.nn.functional import conv3d
+from torch.nn.functional import conv3d, conv2d
 from matplotlib import pyplot as plt
 import pickle as pk
+from neurotools import util
 import sys
+
 
 def compute_acc(y, yhat):
     """
@@ -20,199 +22,6 @@ def compute_acc(y, yhat):
     correct = torch.argmax(yhat, dim=1).int() == y
     acc = 100 * torch.count_nonzero(correct) / len(y)
     return acc.detach().cpu().item()
-
-class GlobalCrossDecoder:
-    """
-    Trains a torch.nn compliant model (user provided) m to decode from provided train dataset. Also learns a single mask
-    convolved with a fixed size gaussian kernel, over input data that maximizes the m's performance over a different
-    modality "cross-decoding" set and a held out train set.
-
-    Overall, the model requires a 4 data generators:
-        - in-modality train
-        - in-modality test
-        - cross-modality train
-        - cross-modality test
-
-    and gives model performance over the train and test set, as well as, critically, the final cross decoding maps.
-    """
-
-    def __init__(self, decoders: Tuple[torch.nn.Module], smooth_kernel_size: int, input_spatial: tuple, input_channels: int,
-                 force_mask: torch.Tensor, name: str, n_sets=2, device="cuda", lr=.01, use_train_mask=False,
-                 unique_masks=True, set_names=("shape", "color")):
-        self.decoders = [decoder.to(device) for decoder in decoders]
-        self.spatial = input_spatial
-        self.in_channels = input_channels
-        self.smooth_kernel_size = smooth_kernel_size
-        self.device = device
-        self.force_mask = force_mask.to(self.device).reshape((1, 1) + force_mask.shape)
-        self.mask_in_set = use_train_mask
-        self.set_names = set_names
-        self.n_sets = n_sets
-        self.name = name
-        self.unique_masks = unique_masks
-        self.mask_base = [[torch.nn.Parameter(torch.normal(0, .001, size=(1, 1) + self.spatial, device=device)) for
-                           _ in range(n_sets)] for _ in range(n_sets)]
-        if self.mask_in_set:
-            self.decode_optim = [torch.optim.Adam(lr=lr, params=list(d.parameters()) + [self.mask_base[i][i]])
-                                 for i, d in enumerate(self.decoders)]
-        else:
-            self.decode_optim = [torch.optim.Adam(lr=lr, params=d.parameters()) for i, d in enumerate(self.decoders)]
-        self.mask_optim = [[torch.optim.Adam(lr=lr, params=[m]) if i != j else None for i, m in enumerate(set_masks)] for j, set_masks in enumerate(self.mask_base)]
-        self.restart_marks = []
-        self.lfxn = torch.nn.CrossEntropyLoss()
-        self.loss_histories = [[list() for _ in range(n_sets)] for _ in range(n_sets)]
-        self.sal_maps = None
-        self.accuracies = [[list() for _ in range(n_sets)] for _ in range(n_sets)]
-
-    def gaussian_smoothing(self, tensor, kernel_size):
-        # Create the Gaussian kernel
-        sigma = kernel_size / 3
-        kernel = np.zeros((kernel_size, kernel_size, kernel_size))
-        kernel[kernel_size // 2, kernel_size // 2, kernel_size // 2] = 1
-        kernel = ndimage.gaussian_filter(kernel, sigma)
-        kernel_tensor = torch.from_numpy(kernel).float().unsqueeze(0).unsqueeze(0).to(self.device)
-
-        # Apply the kernel using conv3d function
-        smoothed_tensor = conv3d(tensor, kernel_tensor, padding=kernel_size // 2)
-
-        return smoothed_tensor
-
-    def get_mask(self, mask_base, noise=True):
-        # takes -inf, inf input to range 0, 1. Maintains desirable gradient characteristics.
-        s_gain = mask_base * self.force_mask
-        s_gain = torch.nn.functional.tanh(s_gain)
-        s_gain = torch.pow(s_gain, 2)
-        s_gain = self.gaussian_smoothing(s_gain, kernel_size=self.smooth_kernel_size)
-        return s_gain
-
-    def decode_step(self, decoder, in_train, mask):
-        # preform a decoding step and return cross-entropy loss value.
-        stim, target = in_train.__next__()
-        stim = torch.from_numpy(stim).float().to(self.device)
-        target = torch.from_numpy(target)
-        targets = target.long().to(self.device)
-        stim = stim * mask
-        y_hat = decoder(stim)
-        acc = compute_acc(targets, y_hat)
-        tloss = self.lfxn(y_hat, targets)
-
-        return tloss, acc
-
-    def plot_loss_curves(self):
-        fig, axs = plt.subplots(2, 2)
-        for i in range(self.n_sets):
-            for j in range(self.n_sets):
-                t = np.arange(len(self.loss_histories[i][j]))
-                axs[i, j].plot(t, np.array(self.loss_histories[i][j]))
-                axs[i, j].set_title(self.set_names[i] + " -> " + self.set_names[j] + " Loss")
-        plt.show()
-
-    def _fit(self, X, in_idx, iters=1000):
-        in_optim = self.decode_optim[in_idx]
-        in_optim.zero_grad()
-        X = [X[i] for i in range(self.n_sets)]
-        in_train = X[in_idx]
-        decoder = self.decoder[in_idx]
-        self.sal_maps = None
-        local_loss_history = [list() for _ in range(self.n_sets)]
-        local_acc = [list() for _ in range(self.n_sets)]
-
-        for epoch in range(iters):
-            if self.mask_in_set:
-                in_mask = self.get_mask(self.mask_base[in_idx][in_idx])
-            else:
-                in_mask = self.force_mask.clone()
-            decode_loss, acc = self.decode_step(decoder, in_train, in_mask)
-            l2loss = .22 * torch.mean(
-                torch.stack([torch.mean(torch.pow(param.data.flatten(), 2)) for param in decoder.parameters()]))
-            if self.mask_in_set:
-                l1mask_loss = .04 * torch.sum(in_mask)
-            else:
-                l1mask_loss = 0.
-            local_loss_history[in_idx].append(decode_loss.detach().cpu().item())
-            local_acc[in_idx].append(acc)
-            print(epoch, "IN-MODALITY LOSS:", local_loss_history[in_idx][-1], "ACC", acc, "(REG:",
-                  l2loss.detach().cpu().item(), ")")
-            loss = decode_loss + l2loss + l1mask_loss
-            loss.backward()
-            in_optim.step()
-            in_optim.zero_grad()
-            for x_idx in range(self.n_sets):
-                if x_idx == in_idx:
-                    # don't cross decode from the train set!
-                    continue
-                x_train = X[x_idx]
-                x_optim = self.mask_optim[in_idx][x_idx]
-                x_mask = self.get_mask(self.mask_base[in_idx][x_idx])
-                mask_loss, acc = self.decode_step(decoder, x_train, x_mask)
-                # l2loss = .04 * torch.sum(x_mask)
-                local_loss_history[x_idx].append(mask_loss.detach().cpu().item())
-                local_acc[x_idx].append(acc)
-                print(epoch, "CROSS-MODALITY LOSS:", local_loss_history[x_idx][-1], "ACC", acc, "(REG:", l2loss.detach().cpu().item() ,")")
-                loss2 = mask_loss + l2loss
-                loss2.backward()
-                x_optim.step()
-                x_optim.zero_grad()
-
-            sys.stdout.flush()
-        for dset in X:
-            try:
-                # make sure dataloaders die
-                dset.__next__()
-            except StopIteration:
-                print("dataloader exhausted.")
-                pass
-
-        return local_loss_history, local_acc
-
-    def fit(self, X, iters=1000):
-        """
-        :param X: a list of dataloaders for each set
-        :return:
-        """
-        for i in range(self.n_sets):
-            local_loss, local_acc = self._fit(X, i, iters=iters)
-            for j in range(self.n_sets):
-                self.loss_histories[i][j] += local_loss[j]
-                self.accuracies[i][j] += local_acc[j]
-
-    def compute_saliancy(self, X):
-        count = 0
-        sal_map = [[] for _ in range(self.n_sets)]
-        for i in range(self.n_sets):
-            sal_map.append([])
-            for j in range(self.n_sets):
-                sal_map[i].append(torch.zeros(self.spatial))
-                data = X[j]
-                for k, (stim, target) in enumerate(data):
-                    print("batch", k)
-                    self.decode_optim[i].zero_grad()
-                    with torch.no_grad():
-                        c_stim = torch.nn.Parameter(torch.from_numpy(stim).float().to(self.device).clone())
-                    if not self.mask_in_set and i==j:
-                        s_gain = self.force_mask
-                    else:
-                        s_gain = self.get_mask(self.mask_base[i][j], noise=False)
-                    stim = c_stim * s_gain
-                    # s_gain = torch.abs(gain)
-                    # c_stim = c_stim * s_gain
-                    y_hat = self.decoder[i](stim)
-                    targets = torch.from_numpy(target).long().to(self.device)
-                    # compute gradient of correct yhat with respect to pixels
-                    correct = torch.argmax(y_hat, dim=1).int() == targets
-                    correct_yhat = y_hat[torch.arange(len(y_hat)), targets]
-                    loss = torch.sum(correct_yhat * correct)
-                    loss.backward()
-                    grad_data = c_stim.grad.data
-                    # get gradient magnitude
-                    over_chan = torch.sum(grad_data, dim=(0, 1))
-                    sal = torch.abs(over_chan)
-                    sal_map[i][j] += sal.detach().cpu()
-                    count += torch.count_nonzero(correct).cpu()
-                self.decode_optim[i].zero_grad()
-                sal_map[i][j] = sal_map[i][j].numpy()
-        self.sal_maps = sal_map
-        return sal_map
 
 
 class GlobalMultiStepCrossDecoder:
@@ -243,6 +52,7 @@ class GlobalMultiStepCrossDecoder:
 
         self.decoder = [d.to(device) for d in decoder]
         self.spatial = input_spatial
+        self.spatial_dims = len(input_spatial)
         self.in_channels = input_channels
         self.smooth_kernel_size = smooth_kernel_size
         self.device = device
@@ -263,35 +73,51 @@ class GlobalMultiStepCrossDecoder:
     def _reset_mask(self):
         if not hasattr(self, "lr"):
             self.lr = .01
-        self.mask_base = [[torch.nn.Parameter(torch.normal(.75, .2, size=(1, 1) + self.spatial, device=self.device)) for
+        # initial mask is set such as to be in the unstable regime of loss function + regularizer
+        self.mask_base = [[torch.nn.Parameter(torch.normal(.75,
+                                                           .2,
+                                                           size=(1, 1) + self.spatial, device=self.device)) for
                            _ in range(self.n_sets)] for _ in range(self.n_sets)]
         self.mask_optim = [[torch.optim.Adam(lr=self.lr, params=[m]) for m in set_masks] for set_masks in self.mask_base]
 
     def _create_smoothing_kernel(self, kernel_size):
         # Create the Gaussian kernel
-        sigma = kernel_size / 5
-        kernel = np.zeros((kernel_size, kernel_size, kernel_size))
-        kernel[kernel_size // 2, kernel_size // 2, kernel_size // 2] = 1
-        kernel = ndimage.gaussian_filter(kernel, sigma)
-        kernel = kernel / np.sum(kernel)
+        sigma = kernel_size / 4
+        if self.spatial_dims == 2:
+            kernel = np.zeros((kernel_size, kernel_size))
+            kernel[kernel_size // 2, kernel_size // 2] = 1
+            kernel = ndimage.gaussian_filter(kernel, sigma)
+
+        elif self.spatial_dims == 3:
+            kernel = np.zeros((kernel_size, kernel_size, kernel_size))
+            kernel[kernel_size // 2, kernel_size // 2, kernel_size // 2] = 1
+            kernel = ndimage.gaussian_filter(kernel, sigma)
+        kernel = kernel / np.max(kernel)  # kernel takes average over space instead of sum
+        kernel = kernel + np.random.normal(0, .05, size=kernel.shape)  # add sampling uncertainty
         kernel_tensor = torch.from_numpy(kernel).float().unsqueeze(0).unsqueeze(0).to(self.device)
         return kernel_tensor
 
     def gaussian_smoothing(self, tensor, *args):
         # Apply the kernel using conv3d function
-        smoothed_tensor = conv3d(tensor, self.smooth_kernel, padding=self.smooth_kernel_size // 2)
+        stride = 2 # self.smooth_kernel_size // 2
+        if self.spatial_dims == 3:
+            smoothed_tensor = conv3d(tensor, self.smooth_kernel, stride=stride, padding=self.smooth_kernel_size // 2)
+        elif self.spatial_dims == 2:
+            smoothed_tensor = conv2d(tensor, self.smooth_kernel, stride=stride, padding=self.smooth_kernel_size // 2)
+        upsampler = torch.nn.Upsample(size=self.spatial, mode="nearest")
+        smoothed_tensor = upsampler(smoothed_tensor)
         return smoothed_tensor
 
-    def get_mask(self, mask_base, noise=True):
+    def get_mask(self, mask_base, noise=True, reg=False):
         # takes -inf, inf input to range 0, 1. Maintains desirable gradient characteristics.
-        s_gain = mask_base * self.force_mask
-        s_gain = torch.tanh(s_gain - .001)
-        s_gain = torch.pow(s_gain, 2)
-        s_gain = self.gaussian_smoothing(s_gain)
-        s_gain = torch.tanh(s_gain + .001)
-        s_gain = torch.pow(s_gain, 2)
-        s_gain = s_gain / torch.max(s_gain)
-        return s_gain
+        s_gain = torch.abs(mask_base * self.force_mask)
+        b_gain = torch.tanh(s_gain)
+        s_gain = self.gaussian_smoothing(b_gain)
+        final_mask = torch.tanh(s_gain)  # addition of normal makes estimator unstable in linear regime
+        if reg:
+            return final_mask, 2*torch.mean(.5*s_gain + torch.pow(torch.e, -torch.pow(b_gain - .5, 2)))
+        else:
+            return final_mask
 
     def decode_step(self, decoder, in_train, mask):
         # preform a decoding step and return cross-entropy loss value.
@@ -303,7 +129,6 @@ class GlobalMultiStepCrossDecoder:
         y_hat = decoder(stim)
         acc = compute_acc(targets, y_hat)
         tloss = self.lfxn(y_hat, targets)
-
         return tloss, acc
 
     def plot_loss_curves(self):
@@ -329,13 +154,15 @@ class GlobalMultiStepCrossDecoder:
             for x_idx in range(self.n_sets):
                 x_train = X[x_idx]
                 x_optim = self.mask_optim[in_idx][x_idx]
-                x_mask = self.get_mask(self.mask_base[in_idx][x_idx])
+                x_mask, mask_regularize = self.get_mask(self.mask_base[in_idx][x_idx], reg=True)
+
+                x_mask = torch.tanh(x_mask)
                 mask_loss, acc = self.decode_step(decoder, x_train, x_mask)
-                l2loss = .00025 * torch.sum(torch.pow(x_mask, 2))
                 local_loss_history[x_idx].append(mask_loss.detach().cpu().item())
                 local_acc[x_idx].append(acc)
-                print(epoch, "CROSS-MODALITY LOSS:", local_loss_history[x_idx][-1], "ACC", acc, "(REG:", l2loss.detach().cpu().item() ,")")
-                loss2 = mask_loss + l2loss
+                print(epoch, "CROSS-MODALITY LOSS:", local_loss_history[x_idx][-1], "ACC", acc,
+                      "(REG:", mask_regularize.detach().cpu().item(), ")") #  "(REG:", l2loss.detach().cpu().item()
+                loss2 = mask_loss + mask_regularize
                 loss2.backward()
                 x_optim.step()
                 x_optim.zero_grad()
@@ -434,6 +261,150 @@ class GlobalMultiStepCrossDecoder:
                 sal_map[i][j] = sal_map[i][j].numpy()
         self.sal_maps = sal_map
         return sal_map
+
+
+class SearchlightDecoder:
+
+    def __init__(self, kernel_size, pad=1, stride=1, spatial=(64, 64, 64), n_classes=6, channels=1, lr=.01, reg=.1, device="cpu",
+                 num_layer=3, hidden_channels=3, nonlinear=False, standardization_mode=None, reweight=False):
+        self.kernel_size = kernel_size
+        self.in_spatial = spatial
+        self.dim = len(spatial)
+        self.stride = stride
+        self.reweight = reweight  # whether to give more weight to incorrect predictions
+        self.std_mode = standardization_mode
+        self.device = device
+        self.n_classes = n_classes
+        if n_classes == 2:
+            self.binary = True
+            self.out_channels = 1
+        else:
+            self.binary = False
+            self.out_channels = n_classes
+        self.lr = lr
+        self.nonlinear = nonlinear
+        self.pad = pad
+        self.channels = channels
+        self.all_channels = [channels] + list(range(hidden_channels, hidden_channels - num_layer + 1, -1)) + [self.out_channels]
+        self.reg_coef = reg
+        self.weights = []
+        all_spatials = [np.array(self.in_spatial)]
+        for i in range(num_layer):
+            step = (((all_spatials[-1] - kernel_size + 2 * pad) / stride) + 1).astype(int)
+            weight_shape = (int(np.prod(step)),
+                            self.all_channels[i] * (kernel_size**self.dim),
+                            self.all_channels[i + 1])
+            weights = torch.empty(weight_shape, dtype=torch.double, device=device)
+            weights = torch.nn.init.xavier_uniform(weights)
+            self.weights.append(torch.nn.Parameter(weights))
+            all_spatials.append(step)
+        self.optim = torch.optim.Adam(self.weights, lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,1500, .2)
+        self.out_spatials = all_spatials[1:]
+        self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)
+        ce = torch.nn.CrossEntropyLoss()
+        self.chance_ce = ce(torch.zeros((1, self.n_classes)), torch.ones((1,), dtype=torch.long))
+        print("unfolded space with dimensionality ", channels * kernel_size ** self.dim, "x", self.out_spatials[-1])
+
+    def step(self, stim):
+        stim = torch.from_numpy(stim).double().to(self.device)
+        batch_size = stim.shape[0]
+        h = stim
+        iterrule = "bks,skc->bcs"
+        for i in range(len(self.weights)):
+            ufld_stim = util.unfold_nd(h, self.kernel_size, self.pad, self.dim, self.stride)  # batch size (b), kernel dims (k), spatial dims (s),
+            if self.std_mode == "spatial":
+                # designed to eliminate differences in signal intensity as a source of error, idk might not work at all.
+                means = ufld_stim.mean(dim=1).unsqueeze(1)
+                std = ufld_stim.std(dim=1).unsqueeze(1)
+                ufld_stim = (ufld_stim - means) / std
+            h = torch.einsum(iterrule, ufld_stim, self.weights[i])  # batch (b), hidden channels, spatial (s)
+            h = h.view([batch_size, self.all_channels[i+1]] + list(self.out_spatials[i]))
+            if self.nonlinear:
+                h = torch.relu(h)
+        y_hat = h.reshape([batch_size, self.out_channels, int(np.prod(self.out_spatials[-1]))])
+        if self.binary:
+            y_hat = torch.cat([y_hat, -y_hat], dim=1)
+        return y_hat
+
+    def evaluate(self, dataloader):
+        ce_tracker = None
+        acc_tracker = None
+        loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
+        count = 0
+        with torch.no_grad():
+            for i, (stim, target) in enumerate(dataloader):
+                target = torch.from_numpy(target)
+                targets = target.long().to(self.device).reshape([-1] + [1]*self.dim)
+                targets = torch.tile(targets, [1] + list(self.out_spatials[-1]))
+                batch_size = len(target)
+                y_hat = self.step(stim).reshape(([batch_size, self.n_classes] + list(self.out_spatials[-1])))
+                loss = loss_fxn(y_hat, targets)
+                loss = loss.mean(dim=0)
+                if self.dim == 2:
+                    correct = torch.argmax(y_hat, dim=1) == targets
+                elif self.dim == 3:
+                    correct = torch.argmax(y_hat, dim=1) == targets
+                else:
+                    raise ValueError
+                spatial_acc = correct.sum(dim=0) / batch_size
+                if ce_tracker is None:
+                    ce_tracker = self.chance_ce - loss.detach().cpu()
+                    acc_tracker = spatial_acc.detach().cpu()
+                else:
+                    acc_tracker += spatial_acc.detach().cpu()
+                    ce_tracker += self.chance_ce - loss.detach().cpu()
+                count += 1
+        if self.dim == 3:
+            method = "trilinear"
+        elif self.dim == 2:
+            method = "bilinear"
+        else:
+            raise ValueError
+        acc_tracker = torch.nn.functional.interpolate(acc_tracker.unsqueeze(0).unsqueeze(0),
+                                                      size=self.in_spatial, mode=method).squeeze()
+        ce_tracker = torch.nn.functional.interpolate(ce_tracker.unsqueeze(0).unsqueeze(0),
+                               size=self.in_spatial, mode=method).squeeze()
+        return acc_tracker / count, ce_tracker / count
+
+    def fit(self, dataloader):
+        loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
+        for i, (stim, target) in enumerate(dataloader):
+            self.optim.zero_grad()
+            target = torch.from_numpy(target)
+            target = target.long().to(self.device).reshape([-1, 1])
+            targets = torch.tile(target, [1, int(np.prod(self.out_spatials[-1]))])
+            l2_penalty = torch.sum(torch.stack([torch.sum(torch.pow(w, 2)) for w in self.weights]))
+            y_hat = self.step(stim)
+            loss = loss_fxn(y_hat, targets)
+            if self.reweight:
+                # prevents a single easy to classify class from dominating predictions.
+                with torch.no_grad():
+                    pred = torch.argmax(y_hat, dim=1)
+                    for j in range(self.n_classes):
+                        c_dex = torch.nonzero(target.flatten() == j).reshape((-1))
+                        # class weight moves toward local class weight from this class
+                        if len(c_dex) != 0:
+                            class_acc = 1 - ((torch.count_nonzero(pred[c_dex, :] == target[c_dex, :], dim=0)) / (len(c_dex)))
+                            diff_from_chance = (self.class_weights[j, :] - class_acc)
+                            self.class_weights[j, :] = self.class_weights[j, :] - (.025 * len(c_dex) * diff_from_chance[None, :])
+                        # relative class importance changes, but overall magnitude stays the same.
+                        self.class_weights = self.n_classes * self.class_weights / torch.sum(self.class_weights, dim=0)[None, :]
+                        loss[c_dex, :] = loss[c_dex, :] * self.class_weights[j, :][None, :]
+
+            loss = torch.sum(loss) + self.reg_coef * l2_penalty  # (1)
+            print("EPOCH", i, "LOSS", loss.detach().cpu().item())
+            loss.backward()
+            self.optim.step()
+            self.scheduler.step()
+        
+
+
+
+
+
+
+
 
 
 
