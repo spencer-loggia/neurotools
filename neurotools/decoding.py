@@ -368,15 +368,20 @@ class SearchlightDecoder:
         acc_tracker = None
         loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
         count = 0
+        # don't track gradients when evaluating
         with torch.no_grad():
             for i, (stim, target) in enumerate(dataloader):
+                # convert targets to tensors
                 target = torch.from_numpy(target)
                 targets = target.long().to(self.device).reshape([-1] + [1]*self.dim)
                 targets = torch.tile(targets, [1] + list(self.out_spatials[-1]))
                 batch_size = len(target)
+                # compute class logits and unflatten spatial dimensions
                 y_hat = self.step(stim).reshape(([batch_size, self.n_classes] + list(self.out_spatials[-1])))
+                # compute cross entropy and average across examples
                 loss = loss_fxn(y_hat, targets)
                 loss = loss.mean(dim=0)
+                # compute class prediction and batch accuracy
                 if self.dim == 2:
                     correct = torch.argmax(y_hat, dim=1) == targets
                 elif self.dim == 3:
@@ -384,6 +389,7 @@ class SearchlightDecoder:
                 else:
                     raise ValueError
                 spatial_acc = correct.sum(dim=0) / batch_size
+                # update combined acc, ce
                 if ce_tracker is None:
                     ce_tracker = self.chance_ce - loss.detach().cpu()
                     acc_tracker = spatial_acc.detach().cpu()
@@ -391,6 +397,7 @@ class SearchlightDecoder:
                     acc_tracker += spatial_acc.detach().cpu()
                     ce_tracker += self.chance_ce - loss.detach().cpu()
                 count += 1
+        # interpolate away small size changes from certain kernel / pad / layer combos.
         if self.dim == 3:
             method = "trilinear"
         elif self.dim == 2:
@@ -401,6 +408,7 @@ class SearchlightDecoder:
                                                       size=self.in_spatial, mode=method).squeeze()
         ce_tracker = torch.nn.functional.interpolate(ce_tracker.unsqueeze(0).unsqueeze(0),
                                size=self.in_spatial, mode=method).squeeze()
+        # return averages across batches.
         return acc_tracker / count, ce_tracker / count
 
     def fit(self, dataloader):
