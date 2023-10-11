@@ -267,6 +267,24 @@ class SearchlightDecoder:
 
     def __init__(self, kernel_size, pad=1, stride=1, spatial=(64, 64, 64), n_classes=6, channels=1, lr=.01, reg=.1, device="cpu",
                  num_layer=3, hidden_channels=3, nonlinear=False, standardization_mode=None, reweight=False):
+        """
+        Class to fit a layered convolutional searchlight over input data with 2 or 3 spatial dimensions.
+        Args:
+            kernel_size: int, Size of the kernel for each layer.
+            pad: int, Padding to use for each layer
+            stride: int, stride for each layer
+            spatial: tuple, input spatial dimmensions
+            n_classes: int, number of classes
+            channels: int, number of input data channels
+            lr: float, starting (maximum) learning rate
+            reg: float, L2 regularization coefficient
+            device: str, which hardware to use.
+            num_layer: int, number of layers
+            hidden_channels: int, number of channels for intermediate (hidden) layers
+            nonlinear: bool, whether to use a nonlinear activation function between layers
+            standardization_mode: str, default 'none'
+            reweight: bool, whether to increase importance of difficult classes over training
+        """
         self.kernel_size = kernel_size
         self.in_spatial = spatial
         self.dim = len(spatial)
@@ -289,6 +307,7 @@ class SearchlightDecoder:
         self.reg_coef = reg
         self.weights = []
         all_spatials = [np.array(self.in_spatial)]
+        # compute the weight dimensions for each layer.
         for i in range(num_layer):
             step = (((all_spatials[-1] - kernel_size + 2 * pad) / stride) + 1).astype(int)
             weight_shape = (int(np.prod(step)),
@@ -298,23 +317,33 @@ class SearchlightDecoder:
             weights = torch.nn.init.xavier_uniform(weights)
             self.weights.append(torch.nn.Parameter(weights))
             all_spatials.append(step)
+        # setup optimization scheme
         self.optim = torch.optim.Adam(self.weights, lr=lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,1500, .2)
         self.out_spatials = all_spatials[1:]
-        self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)
+        self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)  # modified if reweight is enabled
         ce = torch.nn.CrossEntropyLoss()
         self.chance_ce = ce(torch.zeros((1, self.n_classes)), torch.ones((1,), dtype=torch.long))
-        print("unfolded space with dimensionality ", channels * kernel_size ** self.dim, "x", self.out_spatials[-1])
+        print("final unfolded space with dimensionality ", channels * kernel_size ** self.dim, "x", self.out_spatials[-1])
 
     def step(self, stim):
+        """
+        A single model iteration
+        Args:
+            stim: np.ndarray, size(batch, channels, *in_spatial) the input data
+        Returns: torch.Tensor, size(batch, classes, out_spatial) class logits for each example at each point in space
+
+        """
         stim = torch.from_numpy(stim).double().to(self.device)
         batch_size = stim.shape[0]
         h = stim
         iterrule = "bks,skc->bcs"
+        # unfold, apply weights, and refold in sequence.
         for i in range(len(self.weights)):
             ufld_stim = util.unfold_nd(h, self.kernel_size, self.pad, self.dim, self.stride)  # batch size (b), kernel dims (k), spatial dims (s),
             if self.std_mode == "spatial":
                 # designed to eliminate differences in signal intensity as a source of error, idk might not work at all.
+                # seems to only hurt, not using
                 means = ufld_stim.mean(dim=1).unsqueeze(1)
                 std = ufld_stim.std(dim=1).unsqueeze(1)
                 ufld_stim = (ufld_stim - means) / std
@@ -328,6 +357,13 @@ class SearchlightDecoder:
         return y_hat
 
     def evaluate(self, dataloader):
+        """
+        Generate output CE and ACC maps (2d or 3d) given input data using the trained model.
+        Args:
+            dataloader: generator that returns np.ndarrays of stim data at index 0
+        Returns: torch.Tensor ACC_map, torch.Tensor CE_map
+
+        """
         ce_tracker = None
         acc_tracker = None
         loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -368,17 +404,28 @@ class SearchlightDecoder:
         return acc_tracker / count, ce_tracker / count
 
     def fit(self, dataloader):
+        """
+        fit the layered searchlight model.
+        Args:
+            dataloader: generator that returns np.ndarrays of stim data, and np.ndarray of targets class labels.
+        Returns: None
+
+        """
         loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
         for i, (stim, target) in enumerate(dataloader):
             self.optim.zero_grad()
+            # convert targets to tensors
             target = torch.from_numpy(target)
             target = target.long().to(self.device).reshape([-1, 1])
             targets = torch.tile(target, [1, int(np.prod(self.out_spatials[-1]))])
+            # compute regularization penalty
             l2_penalty = torch.sum(torch.stack([torch.sum(torch.pow(w, 2)) for w in self.weights]))
+            # get predictions at each spatial location
             y_hat = self.step(stim)
+            # compute loss independently for each logit set
             loss = loss_fxn(y_hat, targets)
             if self.reweight:
-                # prevents a single easy to classify class from dominating predictions.
+                # prevents easy to classify class from dominating training dynamics.
                 with torch.no_grad():
                     pred = torch.argmax(y_hat, dim=1)
                     for j in range(self.n_classes):
@@ -391,9 +438,10 @@ class SearchlightDecoder:
                         # relative class importance changes, but overall magnitude stays the same.
                         self.class_weights = self.n_classes * self.class_weights / torch.sum(self.class_weights, dim=0)[None, :]
                         loss[c_dex, :] = loss[c_dex, :] * self.class_weights[j, :][None, :]
-
+            # collapse loss
             loss = torch.sum(loss) + self.reg_coef * l2_penalty  # (1)
             print("EPOCH", i, "LOSS", loss.detach().cpu().item())
+            # apply gradients
             loss.backward()
             self.optim.step()
             self.scheduler.step()
