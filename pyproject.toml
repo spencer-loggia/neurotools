@@ -1,0 +1,11 @@
+[project]
+name = "neurotools"
+description = "awesome"
+version = "0.3.1"
+authors = [
+    { name = "Spencer R. Loggia", email = "spncer.loggia98@gmail.com" }
+]
+
+
+[tool.setuptools]
+packages = ["neurotools"]
