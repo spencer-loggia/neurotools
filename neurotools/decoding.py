@@ -314,20 +314,23 @@ class SearchlightDecoder:
         # compute the weight dimensions for each layer.
         for i in range(num_layer):
             step = (((all_spatials[-1] - self.kernel[i] + 2 * pad) / stride) + 1).astype(int)
+            # weights for each filter in this layer. (spatial, c_in * kernel, c_out)
             weight_shape = (int(np.prod(step)),
                             self.all_channels[i] * (self.kernel[i]**self.dim),
                             self.all_channels[i + 1])
+            # initialize weights following xavier protocol
             weights = torch.empty(weight_shape, dtype=torch.double, device=device)
             weights = torch.nn.init.xavier_uniform(weights)
+            # track weights as torch Parameters
             self.weights.append(torch.nn.Parameter(weights))
             all_spatials.append(step)
         # setup optimization scheme
         self.optim = torch.optim.Adam(self.weights, lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,1500, .2)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,1500, .2)  # reduce the maximum learning rate every step epochs
         self.out_spatials = all_spatials[1:]
         self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)  # modified if reweight is enabled
         ce = torch.nn.CrossEntropyLoss()
-        self.chance_ce = ce(torch.zeros((1, self.n_classes)), torch.ones((1,), dtype=torch.long))
+        self.chance_ce = ce(torch.zeros((1, self.n_classes)), torch.ones((1,), dtype=torch.long)) # compute maximum theoretical cross entropy.
         print("final unfolded space with dimensionality ", channels * self.kernel[-1] ** self.dim, "x", self.out_spatials[-1])
 
     def step(self, stim):
@@ -351,11 +354,14 @@ class SearchlightDecoder:
                 means = ufld_stim.mean(dim=1).unsqueeze(1)
                 std = ufld_stim.std(dim=1).unsqueeze(1)
                 ufld_stim = (ufld_stim - means) / std
+            # mapping input kernel to out channels in next layer for each example for each location in space,
             h = torch.einsum(iterrule, ufld_stim, self.weights[i])  # batch (b), hidden channels, spatial (s)
+            # fold to next layer.
             h = h.view([batch_size, self.all_channels[i+1]] + list(self.out_spatials[i]))
             if self.nonlinear:
-                h = torch.relu(h)
+                h = torch.relu(h)  # we don't use a nonlinearity by default
         y_hat = h.reshape([batch_size, self.out_channels, int(np.prod(self.out_spatials[-1]))])
+        # in the binary case, we need only predict a single scalar. Class is sign(y_hat)
         if self.binary:
             y_hat = torch.cat([y_hat, -y_hat], dim=1)
         return y_hat
@@ -370,6 +376,7 @@ class SearchlightDecoder:
         """
         ce_tracker = None
         acc_tracker = None
+        # a non-reducing loss function gives a separate loss value for every input
         loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
         count = 0
         # don't track gradients when evaluating
