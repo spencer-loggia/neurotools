@@ -1,7 +1,7 @@
 [project]
 name = "neurotools"
-description = "awesome"
-version = "0.3.1"
+description = "Adds the searlight decoder."
+version = "0.3.3"
 authors = [
     { name = "Spencer R. Loggia", email = "spncer.loggia98@gmail.com" }
 ]
