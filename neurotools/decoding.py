@@ -306,7 +306,7 @@ class SearchlightDecoder:
         self.nonlinear = nonlinear
         self.pad = pad
         self.channels = channels
-        hc = [math.ceil(n_classes / 2) * max(c, 1) for c in range(hidden_channels, hidden_channels - num_layer + 1, -1)]
+        hc = [math.ceil(n_classes / 3) * max(c, 1) for c in range(hidden_channels, hidden_channels - num_layer + 1, -1)]
         self.all_channels = [channels] + hc + [self.out_channels]
         self.reg_coef = reg
         self.weights = []
