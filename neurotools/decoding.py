@@ -1,5 +1,6 @@
 import copy
 import datetime
+import math
 import os
 from typing import Tuple, Union
 
@@ -286,6 +287,8 @@ class SearchlightDecoder:
             reweight: bool, whether to increase importance of difficult classes over training
         """
         self.kernel_size = kernel_size
+        self.kernel = [2] * num_layer
+        self.kernel[0] = self.kernel_size
         self.in_spatial = spatial
         self.dim = len(spatial)
         self.stride = stride
@@ -303,15 +306,16 @@ class SearchlightDecoder:
         self.nonlinear = nonlinear
         self.pad = pad
         self.channels = channels
-        self.all_channels = [channels] + list(range(hidden_channels, hidden_channels - num_layer + 1, -1)) + [self.out_channels]
+        hc = [math.ceil(n_classes / 2) * max(c, 1) for c in range(hidden_channels, hidden_channels - num_layer + 1, -1)]
+        self.all_channels = [channels] + hc + [self.out_channels]
         self.reg_coef = reg
         self.weights = []
         all_spatials = [np.array(self.in_spatial)]
         # compute the weight dimensions for each layer.
         for i in range(num_layer):
-            step = (((all_spatials[-1] - kernel_size + 2 * pad) / stride) + 1).astype(int)
+            step = (((all_spatials[-1] - self.kernel[i] + 2 * pad) / stride) + 1).astype(int)
             weight_shape = (int(np.prod(step)),
-                            self.all_channels[i] * (kernel_size**self.dim),
+                            self.all_channels[i] * (self.kernel[i]**self.dim),
                             self.all_channels[i + 1])
             weights = torch.empty(weight_shape, dtype=torch.double, device=device)
             weights = torch.nn.init.xavier_uniform(weights)
@@ -324,7 +328,7 @@ class SearchlightDecoder:
         self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)  # modified if reweight is enabled
         ce = torch.nn.CrossEntropyLoss()
         self.chance_ce = ce(torch.zeros((1, self.n_classes)), torch.ones((1,), dtype=torch.long))
-        print("final unfolded space with dimensionality ", channels * kernel_size ** self.dim, "x", self.out_spatials[-1])
+        print("final unfolded space with dimensionality ", channels * self.kernel[-1] ** self.dim, "x", self.out_spatials[-1])
 
     def step(self, stim):
         """
@@ -340,7 +344,7 @@ class SearchlightDecoder:
         iterrule = "bks,skc->bcs"
         # unfold, apply weights, and refold in sequence.
         for i in range(len(self.weights)):
-            ufld_stim = util.unfold_nd(h, self.kernel_size, self.pad, self.dim, self.stride)  # batch size (b), kernel dims (k), spatial dims (s),
+            ufld_stim = util.unfold_nd(h, self.kernel[i], self.pad, self.dim, self.stride)  # batch size (b), kernel dims (k), spatial dims (s),
             if self.std_mode == "spatial":
                 # designed to eliminate differences in signal intensity as a source of error, idk might not work at all.
                 # seems to only hurt, not using
@@ -440,7 +444,7 @@ class SearchlightDecoder:
                         c_dex = torch.nonzero(target.flatten() == j).reshape((-1))
                         # class weight moves toward local class weight from this class
                         if len(c_dex) != 0:
-                            class_acc = 1 - ((torch.count_nonzero(pred[c_dex, :] == target[c_dex, :], dim=0)) / (len(c_dex)))
+                            class_acc = 1 - ((torch.count_nonzero(pred[c_dex, :] == target[c_dex, :], dim=0)) / (4 * len(c_dex)))
                             diff_from_chance = (self.class_weights[j, :] - class_acc)
                             self.class_weights[j, :] = self.class_weights[j, :] - (.025 * len(c_dex) * diff_from_chance[None, :])
                         # relative class importance changes, but overall magnitude stays the same.
