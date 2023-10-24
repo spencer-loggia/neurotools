@@ -112,11 +112,11 @@ class GlobalMultiStepCrossDecoder:
     def get_mask(self, mask_base, noise=True, reg=False):
         # takes -inf, inf input to range 0, 1. Maintains desirable gradient characteristics.
         s_gain = torch.abs(mask_base * self.force_mask)
-        b_gain = torch.tanh(s_gain)
-        s_gain = self.gaussian_smoothing(b_gain)
-        final_mask = torch.tanh(s_gain)  # addition of normal makes estimator unstable in linear regime
+        # b_gain = torch.tanh(s_gain)
+        b_gain = self.gaussian_smoothing(s_gain)
+        final_mask = torch.tanh(b_gain)  # addition of normal makes estimator unstable in linear regime
         if reg:
-            return final_mask, 2*torch.mean(.5*s_gain + torch.pow(torch.e, -torch.pow(b_gain - .5, 2)))
+            return final_mask, b_gain # 2*torch.mean(.5*s_gain + torch.pow(torch.e, -torch.pow(b_gain - .5, 2)))
         else:
             return final_mask
 
@@ -141,7 +141,7 @@ class GlobalMultiStepCrossDecoder:
                 axs[i, j].set_title(self.set_names[i] + " -> " + self.set_names[j] + " Loss")
         plt.show()
 
-    def _fit(self, X, in_idx, iters=1000):
+    def _fit(self, X, in_idx, iters=1000, update=True):
         X = [X[i] for i in range(self.n_sets)]
         self.sal_maps = None
         local_loss_history = [list() for _ in range(self.n_sets)]
@@ -164,9 +164,10 @@ class GlobalMultiStepCrossDecoder:
                 print(epoch, "CROSS-MODALITY LOSS:", local_loss_history[x_idx][-1], "ACC", acc,
                       "(REG:", mask_regularize.detach().cpu().item(), ")") #  "(REG:", l2loss.detach().cpu().item()
                 loss2 = mask_loss + mask_regularize
-                loss2.backward()
-                x_optim.step()
-                x_optim.zero_grad()
+                if update:
+                    loss2.backward()
+                    x_optim.step()
+                    x_optim.zero_grad()
 
             sys.stdout.flush()
         for dset in X:
@@ -227,6 +228,19 @@ class GlobalMultiStepCrossDecoder:
             for j in range(self.n_sets):
                 self.loss_histories[i][j] += local_loss[j]
                 self.accuracies[i][j] += local_acc[j]
+
+    def predict(self, X, iters=20):
+        accs = []
+        for i in range(self.n_sets):
+            accs.append([])
+            X.epochs = (iters // 4) + 1
+            X.resample = False
+            with torch.no_grad():
+                local_loss, local_acc = self._fit(X, i, iters=iters, update=False)
+            for j in range(self.n_sets):
+                accs[-1].append(np.array(local_acc[j]).mean())
+        return accs
+
 
     def compute_saliancy(self, X):
         count = 0
@@ -326,7 +340,7 @@ class SearchlightDecoder:
             all_spatials.append(step)
         # setup optimization scheme
         self.optim = torch.optim.Adam(self.weights, lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,1500, .2)  # reduce the maximum learning rate every step epochs
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,300, .2)  # reduce the maximum learning rate every step epochs
         self.out_spatials = all_spatials[1:]
         self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)  # modified if reweight is enabled
         ce = torch.nn.CrossEntropyLoss()
@@ -426,7 +440,7 @@ class SearchlightDecoder:
         """
         fit the layered searchlight model.
         Args:
-            dataloader: generator that returns np.ndarrays of stim data, and np.ndarray of targets class labels.
+            dataloader: generator that returns np.ndarrays of stim data (batch, channels, x, y, z), and np.ndarray of targets (batch,) class labels.
         Returns: None
 
         """
@@ -440,7 +454,7 @@ class SearchlightDecoder:
             # compute regularization penalty
             l2_penalty = torch.sum(torch.stack([torch.sum(torch.pow(w, 2)) for w in self.weights]))
             # get predictions at each spatial location
-            y_hat = self.step(stim)
+            y_hat = self.step(stim)  # (batch, n_classes, spatial)
             # compute loss independently for each logit set
             loss = loss_fxn(y_hat, targets)
             if self.reweight:
@@ -464,8 +478,43 @@ class SearchlightDecoder:
             loss.backward()
             self.optim.step()
             self.scheduler.step()
-        
 
+
+# class ConvDecoder:
+#     def __int__(self, kernel_size=2, pad=0, stride=1, spatial=(64, 64, 64), n_classes=6, channels=2, lr=.01, reg=.05, device="cuda",
+#                  num_layer=3, hidden_channels=2, nonlinear=False, standardization_mode=None, reweight=True):
+#         """
+#         Applies 3 convolutional layers followed by a linear decoder
+#         """
+#         self.pool = torch.nn.MaxPool2d(2)
+#         self.conv1 = torch.nn.Conv3d(kernel_size=2, in_channels=channels, out_channels=hidden_channels)
+#         self.conv2 = torch.nn.Conv3d(kernel_size=2, in_channels=hidden_channels*2, out_channels=hidden_channels * 2)
+#         self.conv3 = torch.nn.Conv3d(kernel_size=2, in_channels=hidden_channels*2, out_channels=hidden_channels)
+#
+#         self.kernel = kernel_size
+#
+#         self.reweight = reweight  # whether to give more weight to incorrect predictions
+#
+#         self.in_spatial = spatial
+#
+#         all_spatials = [np.array(self.in_spatial)]
+#         # compute the out dimensions for each layer.
+#         for i in range(num_layer):
+#             step = (((all_spatials[-1] - self.kernel + 2 * pad) / stride) + 1).astype(int)
+#             all_spatials.append(step)
+#
+#         self.fc = torch.nn.Linear(in_features=int(np.prod(all_spatials[-1] * hidden_channels)), out_features=n_classes)
+#         self.class_weights = torch.ones((n_classes,))  # modified if reweight is enabled
+#
+#         # setup optimization scheme
+#         self.optim = torch.optim.Adam([self.conv1, self.conv2, self.conv3, self.fc], lr=lr)
+#         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim, 500,
+#                                                          .2)  # reduce the maximum learning rate every step epochs
+#         self.out_spatials = all_spatials[1:]
+#         self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))),
+#                                         device=device)  # modified if reweight is enabled
+#
+#     def fit(self, X, y):
 
 
 
