@@ -49,3 +49,8 @@ def batch_mancova(data, targets, return_eig=True):
         return torch.abs(eig_vals), torch.real(eig_vecs)
     else:
         return S
+
+
+
+
+

@@ -61,6 +61,20 @@ def dissimilarity(beta: torch.Tensor, metric='dot'):
         raise NotImplementedError
     return rdm
 
+def dissimilarity_from_supervised(data, targets, metric="dot"):
+    """
+    data is batch, examples, features
+    """
+    group_labels = list(np.unique(targets))
+    group_means = []
+    for t in group_labels:
+        g = data[:, targets == t, :]
+        group_mean = torch.mean(g, dim=1)  # mean across examples
+        group_means.append(group_mean)
+    group_means = torch.cat(group_means, dim=2)  # build "condition" (target) dimmension
+    rdm = dissimilarity(group_means, metric)
+    return rdm
+
 
 def pairwise_rsa(data_region_list, rdm_metric='cosine', pairwise_metric='spearman'):
     """
