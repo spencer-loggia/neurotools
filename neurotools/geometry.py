@@ -71,7 +71,7 @@ def dissimilarity_from_supervised(data, targets, metric="dot"):
         g = data[:, targets == t, :]
         group_mean = torch.mean(g, dim=1)  # mean across examples
         group_means.append(group_mean)
-    group_means = torch.cat(group_means, dim=2)  # build "condition" (target) dimmension
+    group_means = torch.stack(group_means, dim=1)  # build "condition" (target) dimmension
     rdm = dissimilarity(group_means, metric)
     return rdm
 
