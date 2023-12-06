@@ -105,7 +105,7 @@ class Reverb(torch.nn.Module):
 class ElegantReverb(torch.nn.Module):
 
     def __init__(self, num_nodes, spatial1, spatial2, kernel_size, channels, device='cpu',
-                 normalize_conv=True, mask=None, **kwargs):
+                 normalize_conv=True, mask=None, optimize_weights=True, **kwargs):
         """
         serves the same purpose as the standard reverb convolution, but designed to operate on a graph all at once.
 
@@ -119,16 +119,16 @@ class ElegantReverb(torch.nn.Module):
             mask[:, 0] = 0
         self.mask = mask
 
+        self.optimize_weights = optimize_weights
+
         # Non-Parametric Weights used for intrinsic update
         weight = torch.empty((num_nodes, num_nodes,
                               spatial1, spatial2,
                               channels, self.kernel_size, self.kernel_size),
                              device=device)  # 8D Tensor.
         self.weight = torch.nn.init.xavier_normal_(weight)
-
-        # Parametric Weight used for default receptive field
-        prior = torch.empty((num_nodes, num_nodes, channels, self.kernel_size, self.kernel_size), device=device)
-        self.prior = torch.nn.Parameter(torch.nn.init.xavier_normal_(prior))
+        if self.optimize_weights:
+            self.weight = torch.nn.Parameter(weight)
 
         # Channel Mapping
         chan_map = torch.empty((num_nodes, num_nodes, channels, channels), device=device)
@@ -166,10 +166,7 @@ class ElegantReverb(torch.nn.Module):
 
         self.activation_memory = xufld.clone()
 
-        conv_weight = self.weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1)
-        prior_weight = self.prior * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1)
-
-        combined_weight = conv_weight + prior_weight[:, :, None, None, :, :, :]  # broadcast along spatial 1 and 2
+        combined_weight = self.weight * self.mask.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1)
         combined_weight = combined_weight.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels,
                                                 self.kernel_size ** 2))
         meta_state = combined_weight * xufld
@@ -227,10 +224,10 @@ class ElegantReverb(torch.nn.Module):
 
         plasticity = self.plasticity.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1).clone()
 
-        self.weight = (1 - plasticity) * self.weight + \
-                      plasticity * coactivation.view((self.num_nodes, self.num_nodes,
-                                                      self.spatial1, self.spatial2,
-                                                      self.channels, self.kernel_size, self.kernel_size))
+        self.weight.data = (1 - plasticity) * self.weight + plasticity * coactivation.view((self.num_nodes, self.num_nodes,
+                                                                                       self.spatial1, self.spatial2,
+                                                                                       self.channels, self.kernel_size,
+                                                                                       self.kernel_size))
 
     def detach(self, reset_weight=False):
         if reset_weight:
@@ -240,8 +237,8 @@ class ElegantReverb(torch.nn.Module):
             self.weight = self.weight.detach().clone()
         self.chan_map = torch.nn.Parameter(self.chan_map.detach())
         self.activation_memory = None
-        self.prior = torch.nn.Parameter(self.prior.detach())
         self.plasticity = torch.nn.Parameter(self.plasticity.detach())
+        
 
     def to(self, device):
         self.weight = self.weight.to(device)
@@ -351,7 +348,7 @@ class ElegantWeightedConvolution(torch.nn.Module):
             print("WARN: Reverb  input activations are expected to have range 0 to 1")
         xufld = self.unfolder(x).transpose(0, 1)  # channels * kernel * kernel, nodes, spatial1 * spatial2
         if self.inject_noise:
-            noise = torch.normal(size=self.conv.shape, std=.001, mean=0, device=self.device)
+            noise = torch.normal(size=self.conv.shape, std=.01, mean=0, device=self.device)
         else:
             noise = 0
         conv_weight = torch.abs((self.conv.clone() + noise).view(self.num_nodes, self.num_nodes, self.out_channels, -1))

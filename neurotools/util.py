@@ -30,6 +30,8 @@ def conv_identity_params(in_spatial, desired_kernel, stride=1):
     :return:
 
     """
+    if desired_kernel == 1:
+        return 1, 0
     pad = .1
     in_spatial /= stride
     kernel = min(desired_kernel, in_spatial)
@@ -46,7 +48,8 @@ def conv_identity_params(in_spatial, desired_kernel, stride=1):
             raise RuntimeError("Could not find kernel pad combination to maintain dimensionality")
         kernel = max(kernel - 1, 0)
 
-    return kernel + 1, int(pad)
+    print("Using kernel", kernel + 1, " and pad", int(pad))
+    return int(kernel + 1), int(pad)
 
 
 def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatial_dims: int, stride=1):

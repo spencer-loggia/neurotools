@@ -264,8 +264,8 @@ class FuzzyRL:
     """
     _OUTPUT_DIM = 2
 
-    def __init__(self, state_generator, spatial, num_nodes=4, stim_frames=1,
-                 max_iter=1000, input_node=1, feedback_node=2, output_node=3, device='cpu'):
+    def __init__(self, state_generator, spatial, num_nodes=3, stim_frames=1,
+                 max_iter=1000, input_node=1, output_node=3, device='cpu', output=4):
         """
         get ouptu angles by cosine distance from output channel 1 - 2 and output channel 2 - 3
         :param state_generator: when polled (given action) returns next state and associated value.
@@ -273,9 +273,7 @@ class FuzzyRL:
         :param num_nodes: number of computational graph nodes
         :param stim_frames: frames of computation per state presentation
         :param max_iter:
-        :param input_node: node where state is inserted
-        :param feedback_node: node where loss is inserted
-        :param output_node: node that action is decoded from
+        :param input_node: node where state is inserted        :param output_node: node that action is decoded from
         :param device: hardware to use for optimization
         """
         self.state_generator = state_generator
@@ -287,23 +285,14 @@ class FuzzyRL:
             raise ValueError("state generator resolution must equal network spatial dimensionality.")
         self.cycles_per_stim = stim_frames
         self.input_node = input_node
-        self.feedback_node = feedback_node
         self.output_node = output_node
         self.device = device
         self.max_iter = max_iter
         self.model = models.ElegantReverbNetwork(num_nodes=num_nodes, input_nodes=(input_node,), device=self.device,
                                                  node_shape=(1, 3, spatial, spatial))
-        self.decoder = torch.nn.Parameter(torch.normal(0, .1, size=(self.spatial**2, FuzzyRL._OUTPUT_DIM),
+        self.decoder = torch.nn.Parameter(torch.normal(0, .1, size=(self.spatial**2, output),
                                                        device=self.device))
-        self.optim = torch.optim.Adam(lr=.0001, params=list(self.model.parameters()) + [self.decoder] + self.state_generator.selector.loci)
-
-    def compute_loss_rep(self, log_loss):
-        loss_matrix = np.zeros((self.spatial ** 2))
-        progress = (log_loss - self.min_loss) / (self.max_loss - self.min_loss)
-        bound = torch.floor(progress * (self.spatial ** 2))
-        loss_matrix[:bound] = loss_matrix[:bound] + 1
-        loss_matrix = loss_matrix.reshape(self.spatial, self.spatial)
-        return loss_matrix
+        self.optim = torch.optim.Adam(lr=.0001, params=list(self.model.parameters()) + [self.decoder])
 
     def delta(self, state):
         """
@@ -316,18 +305,6 @@ class FuzzyRL:
         action = action.reshape(1, self.spatial**2)
         action = action.clone() @ self.decoder
         return action
-
-    def learning_fit(self, entropy_curve):
-        """
-        method to make approximate how well model fit matches natural learning.
-        :param entropy_curve:
-        :return:
-        """
-        trials = len(entropy_curve)
-        match_loss = torch.sum(entropy_curve * (torch.arange(trials, device=self.device) / trials))
-        chance_loss = torch.sum((torch.abs(entropy_curve - self.chance_loss)) *
-                                (1 - (torch.arange(trials, device=self.device) / trials)))
-        return match_loss + chance_loss
 
     def evolve(self, generations=1000):
         """
