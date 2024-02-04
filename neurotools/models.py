@@ -27,21 +27,20 @@ class ElegantReverbNetwork(torch.nn.Module):
         self.num_nodes = num_nodes
         self.resistive = is_resistive
         if self.resistive:
-            self.resistance = 0.67
+            self.resistance = 0.33
         else:
             self.resistance = 0.0
-        states = torch.empty(size=(self.num_nodes + 1, node_shape[1], node_shape[2], node_shape[3]), device=device)
+        states = torch.empty(size=(self.num_nodes, node_shape[1], node_shape[2], node_shape[3]), device=device)
         self.states = torch.nn.init.xavier_normal_(states)
         if mask is None:
-            mask = torch.ones((num_nodes + 1, num_nodes + 1), device=device)
-            mask[:, 0] = 0
+            mask = torch.ones((num_nodes, num_nodes), device=device)
         if input_nodes is not None:
-            input_nodes = np.array(input_nodes) + 1  # compensate for added stim node.
-            mask[0, np.delete(np.arange(len(mask)), input_nodes)] = 0
+            input_nodes = np.array(input_nodes)  # compensate for added stim node.
         # synaptic module takes n x c x s1 x s2 input and returns output of the same shape.
-        self.edge = edge_module(self.num_nodes + 1, node_shape[2], node_shape[3], kernel_size=kernel_size, channels=node_shape[1],
+        self.edge = edge_module(self.num_nodes, node_shape[2], node_shape[3], kernel_size=kernel_size, channels=node_shape[1],
                                 device=device, mask=mask, inject_noise=inject_noise, normalize_conv=False, init_plasticity=.2)
         self.inject_noise = inject_noise
+        self.noise = .1
         self.sigmoid = torch.nn.Sigmoid()
         if track_activation_history:
             self.past_states = []
@@ -51,8 +50,11 @@ class ElegantReverbNetwork(torch.nn.Module):
 
     def forward(self, x=None):
         if x is not None:
-            self.states[0] = x
-        activ = self.sigmoid(self.states - .5 + torch.normal(0, .1, self.states.shape))
+            if x.shape == self.states.shape:
+                self.states = (self.states * torch.logical_not(x)) + x
+            else:
+                raise IndexError
+        activ = self.sigmoid(self.states - 1.0 + torch.normal(0, self.noise, self.states.shape))
         #activ = (self.states > 1.).float()
         self.edge.update(activ)
         out_activ = self.edge(activ).clone()
@@ -63,7 +65,8 @@ class ElegantReverbNetwork(torch.nn.Module):
 
     def detach(self, reset_intrinsic=False):
         self.edge.detach(reset_weight=reset_intrinsic)
-        self.states = torch.zeros_like(self.states)
+        states = torch.zeros_like(self.states)
+        self.states = torch.nn.init.xavier_normal_(states)
         self.past_states = []
         return self
 

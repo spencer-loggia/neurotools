@@ -119,16 +119,14 @@ class ElegantReverb(torch.nn.Module):
             mask[:, 0] = 0
         self.mask = mask
 
-        self.optimize_weights = optimize_weights
-
         # Non-Parametric Weights used for intrinsic update
         weight = torch.empty((num_nodes, num_nodes,
                               spatial1, spatial2,
                               channels, self.kernel_size, self.kernel_size),
                              device=device)  # 8D Tensor.
-        self.weight = torch.nn.init.xavier_normal_(weight)
-        if self.optimize_weights:
-            self.weight = torch.nn.Parameter(weight)
+        self.init_weight = torch.nn.Parameter(torch.nn.init.xavier_normal_(weight))
+
+        self.weight = self.init_weight.clone()
 
         # Channel Mapping
         chan_map = torch.empty((num_nodes, num_nodes, channels, channels), device=device)
@@ -149,9 +147,9 @@ class ElegantReverb(torch.nn.Module):
         self.spatial2 = spatial2
         self.normalize = normalize_conv
 
-    # def parameters(self, recurse: bool = True):
-    #     params = [self.chan_map, self.plasticity, self.prior]
-    #     return params
+    def parameters(self):
+        params = [self.chan_map, self.plasticity, self.init_weight]
+        return params
 
     def forward(self, x):
         x = x.to(self.device)  # nodes, channels, spatial1, spatial2
@@ -224,27 +222,26 @@ class ElegantReverb(torch.nn.Module):
 
         plasticity = self.plasticity.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1).clone()
 
-        self.weight.data = (1 - plasticity) * self.weight + plasticity * coactivation.view((self.num_nodes, self.num_nodes,
+        self.weight = (1 - plasticity) * self.weight + plasticity * coactivation.view((self.num_nodes, self.num_nodes,
                                                                                        self.spatial1, self.spatial2,
                                                                                        self.channels, self.kernel_size,
                                                                                        self.kernel_size))
+        return
 
     def detach(self, reset_weight=False):
         if reset_weight:
-            weight = torch.empty_like(self.weight, device=self.device)
-            self.weight = torch.nn.init.xavier_normal_(weight)
+            self.weight = self.init_weight.clone()
         else:
-            self.weight = self.weight.detach().clone()
-        self.chan_map = torch.nn.Parameter(self.chan_map.detach())
+            self.weight = self.weight.clone()
+        # self.chan_map = self.chan_map.detach()
+        # self.plasticity = self.plasticity.detach()
         self.activation_memory = None
-        self.plasticity = torch.nn.Parameter(self.plasticity.detach())
-        
 
     def to(self, device):
+        self.init_weight = torch.nn.Parameter(self.init_weight.to(device))
         self.weight = self.weight.to(device)
         self.chan_map = torch.nn.Parameter(self.chan_map.to(device))
         self.plasticity = torch.nn.Parameter(self.plasticity.to(device))
-        self.prior = torch.nn.Parameter(self.prior.to(device))
         self.device = device
         return self
 
