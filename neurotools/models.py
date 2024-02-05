@@ -58,7 +58,7 @@ class ElegantReverbNetwork(torch.nn.Module):
         #activ = (self.states > 1.).float()
         self.edge.update(activ)
         out_activ = self.edge(activ).clone()
-        self.states = self.resistance * self.states.detach().clone() + out_activ
+        self.states = self.resistance * self.states.clone() + out_activ
         if self.past_states is not None:
             self.past_states.append(self.states.clone())
         return self.states
