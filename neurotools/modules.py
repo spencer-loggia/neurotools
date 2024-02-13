@@ -207,13 +207,13 @@ class ElegantReverb(torch.nn.Module):
         :param args:
         :return:
         """
+
         if len(target_activation.shape) != 4:
             raise ValueError("Input Tensor Must Be 4D, not shape", target_activation.shape)
         if target_activation.shape[0] != self.num_nodes:
             raise ValueError("Input Tensor must have number of nodes on batch dimension.")
-        if torch.max(target_activation) > 1 or torch.min(target_activation) < 0:
-            pass
-            #print("WARN: Reverb  input activations are expected to have range 0 to 1")
+        if self.debug and (torch.max(target_activation) > 1 or torch.min(target_activation) < 0):
+            print("WARN: Reverb  input activations are expected to have range 0 to 1")
         if self.activation_memory is None:
             return
 
@@ -234,7 +234,7 @@ class ElegantReverb(torch.nn.Module):
         ufld_target = ufld_target.view((self.num_nodes, self.num_nodes, self.spatial1 * self.spatial2, self.channels,
                                         self.kernel_size * self.kernel_size))
 
-        coactivation = 2 * self.activation_memory * ufld_target  # so the 2 factor is so that strong coactivation actually increases the weights.
+        coactivation = self.activation_memory * ufld_target  # [0, 1] -> [0, 1]
 
         plasticity = self.plasticity.view(self.num_nodes, self.num_nodes, 1, 1, 1, 1, 1).clone()
         if self.debug:
