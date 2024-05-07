@@ -71,6 +71,7 @@ class GlobalMultiStepCrossDecoder:
         self.accuracies = [[list() for _ in range(n_sets)] for _ in range(n_sets)]
         self.lr = lr
 
+
     def _reset_mask(self):
         if not hasattr(self, "lr"):
             self.lr = .01
@@ -112,11 +113,11 @@ class GlobalMultiStepCrossDecoder:
     def get_mask(self, mask_base, noise=True, reg=False):
         # takes -inf, inf input to range 0, 1. Maintains desirable gradient characteristics.
         s_gain = torch.abs(mask_base * self.force_mask)
-        # b_gain = torch.tanh(s_gain)
-        b_gain = self.gaussian_smoothing(s_gain)
-        final_mask = torch.tanh(b_gain)  # addition of normal makes estimator unstable in linear regime
+        b_gain = torch.tanh(s_gain)
+        s_gain = self.gaussian_smoothing(b_gain)
+        final_mask = torch.tanh(s_gain)  # addition of normal makes estimator unstable in linear regime
         if reg:
-            return final_mask, b_gain # 2*torch.mean(.5*s_gain + torch.pow(torch.e, -torch.pow(b_gain - .5, 2)))
+            return final_mask, 2*torch.mean(.5*s_gain + torch.pow(torch.e, -torch.pow(b_gain - .5, 2)))
         else:
             return final_mask
 
@@ -233,7 +234,7 @@ class GlobalMultiStepCrossDecoder:
         accs = []
         for i in range(self.n_sets):
             accs.append([])
-            X.epochs = (iters // 4) + 1
+            X.epochs = iters
             X.resample = False
             with torch.no_grad():
                 local_loss, local_acc = self._fit(X, i, iters=iters, update=False)
@@ -338,9 +339,10 @@ class SearchlightDecoder:
             # track weights as torch Parameters
             self.weights.append(torch.nn.Parameter(weights))
             all_spatials.append(step)
+        self.bias = torch.empty(self.in_spatial, device=device)
         # setup optimization scheme
-        self.optim = torch.optim.Adam(self.weights, lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,300, .2)  # reduce the maximum learning rate every step epochs
+        self.optim = torch.optim.Adam(self.weights + [self.bias], lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,2500, .1)  # reduce the maximum learning rate every step epochs
         self.out_spatials = all_spatials[1:]
         self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)  # modified if reweight is enabled
         ce = torch.nn.CrossEntropyLoss()
@@ -357,7 +359,7 @@ class SearchlightDecoder:
         """
         stim = torch.from_numpy(stim).double().to(self.device)
         batch_size = stim.shape[0]
-        h = stim
+        h = stim + self.bias.view((1, 1) + self.in_spatial)
         iterrule = "bks,skc->bcs"
         # unfold, apply weights, and refold in sequence.
         for i in range(len(self.weights)):
@@ -380,11 +382,12 @@ class SearchlightDecoder:
             y_hat = torch.cat([y_hat, -y_hat], dim=1)
         return y_hat
 
-    def evaluate(self, dataloader):
+    def evaluate(self, dataloader, return_logits=False):
         """
         Generate output CE and ACC maps (2d or 3d) given input data using the trained model.
         Args:
             dataloader: generator that returns np.ndarrays of stim data at index 0
+            return_logits: bool, whether to return set of all logits.
         Returns: torch.Tensor ACC_map, torch.Tensor CE_map
 
         """
@@ -393,16 +396,21 @@ class SearchlightDecoder:
         # a non-reducing loss function gives a separate loss value for every input
         loss_fxn = torch.nn.CrossEntropyLoss(reduction="none")
         count = 0
+        yhat_all = []
+        targets_all = []
         # don't track gradients when evaluating
         with torch.no_grad():
             for i, (stim, target) in enumerate(dataloader):
                 # convert targets to tensors
                 target = torch.from_numpy(target)
-                targets = target.long().to(self.device).reshape([-1] + [1]*self.dim)
-                targets = torch.tile(targets, [1] + list(self.out_spatials[-1]))
+                target = target.long().to(self.device).reshape([-1] + [1]*self.dim)
+                targets = torch.tile(target, [1] + list(self.out_spatials[-1]))
                 batch_size = len(target)
                 # compute class logits and unflatten spatial dimensions
                 y_hat = self.step(stim).reshape(([batch_size, self.n_classes] + list(self.out_spatials[-1])))
+                yhat_all.append(y_hat.detach().cpu())
+                targets_all.append(target.flatten().detach().cpu().numpy())
+
                 # compute cross entropy and average across examples
                 loss = loss_fxn(y_hat, targets)
                 loss = loss.mean(dim=0)
@@ -433,7 +441,11 @@ class SearchlightDecoder:
                                                       size=self.in_spatial, mode=method).squeeze()
         ce_tracker = torch.nn.functional.interpolate(ce_tracker.unsqueeze(0).unsqueeze(0),
                                size=self.in_spatial, mode=method).squeeze()
-        # return averages across batches.
+        if return_logits:
+            yhat_all = torch.cat(yhat_all, dim=0)
+            yhat_all = torch.nn.functional.interpolate(yhat_all, size=self.in_spatial, mode=method).squeeze()
+            return acc_tracker / count, ce_tracker / count, yhat_all.numpy(), np.concatenate(targets_all, axis=0)
+            # return averages across batches.
         return acc_tracker / count, ce_tracker / count
 
     def fit(self, dataloader):
@@ -473,7 +485,8 @@ class SearchlightDecoder:
                         loss[c_dex, :] = loss[c_dex, :] * self.class_weights[j, :][None, :]
             # collapse loss
             loss = torch.sum(loss) + self.reg_coef * l2_penalty  # (1)
-            print("EPOCH", i, "LOSS", loss.detach().cpu().item())
+            if ((i + 1) % 100) == 0:
+                print("EPOCH", i, "LOSS", loss.detach().cpu().item())
             # apply gradients
             loss.backward()
             self.optim.step()
