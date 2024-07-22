@@ -20,7 +20,7 @@ def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, 
     dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=cov)
     # get some samples to construct prob estimate
     locs = torch.stack(torch.meshgrid([torch.arange(integral_resolution)
-                                       for _ in kernel_size]), dim=0).view(len(kernel_size), -1).T
+                                       for _ in kernel_size]), dim=0).view(len(kernel_size), -1).T.float()
     if integral_resolution == 1:
         # should sample from middle of intervals if only doing one sampling
         locs += .5
