@@ -1,6 +1,37 @@
+import math
+
 import torch
 import numpy as np
 import networkx as nx
+
+
+def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, renormalize=False):
+    cov=cov.squeeze()
+    dev = cov.device
+    dtype = cov.dtype
+    if cov.ndim != 2:
+        raise ValueError("covariance matrix should have two dims")
+    if len(kernel_size) != cov.shape[0] or cov.shape[0] != cov.shape[1]:
+        raise ValueError("covariance matrix should be square and have size equal to kernel dimensionality")
+
+    mu = torch.tensor([s / 2 for s in kernel_size], device=dev, dtype=dtype)
+    grid = torch.stack(torch.meshgrid([torch.arange(s)
+                                       for s in kernel_size]), dim=0).view(len(kernel_size), -1).T # center on each index
+    dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=cov)
+    # get some samples to construct prob estimate
+    locs = torch.stack(torch.meshgrid([torch.arange(integral_resolution)
+                                       for _ in kernel_size]), dim=0).view(len(kernel_size), -1).T
+    if integral_resolution == 1:
+        # should sample from middle of intervals if only doing one sampling
+        locs += .5
+    else:
+        # need to scale to (0, 1) if doing multiple samples
+        locs = locs / (integral_resolution - 1)
+    # approximate cdf on each unit cube in grid
+    probs = torch.stack([dist.log_prob(grid + l.unsqueeze(0)).exp() for l in locs], dim=0).mean(dim=0)
+    if renormalize:
+        probs = probs / torch.sum(probs)
+    return probs.view((kernel_size))
 
 
 def return_from_reward(rewards, gamma):
