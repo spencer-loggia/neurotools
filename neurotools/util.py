@@ -5,6 +5,23 @@ import numpy as np
 import networkx as nx
 
 
+def logistic_func(input, initial, final, log_tau):
+    """
+    returns the standard logistic function
+    Args:
+        initial:
+        final:
+        log_tau:
+
+    Returns:
+    """
+    input = input.unsqueeze(1)
+    num = final.unsqueeze(0)
+    exponent = -torch.exp(log_tau) * (input - initial.unsqueeze(0))
+    denom = 1 + torch.exp(exponent)
+    return num / denom
+
+
 def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, renormalize=False):
     cov=cov.squeeze()
     dev = cov.device
@@ -16,11 +33,20 @@ def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, 
 
     mu = torch.tensor([s / 2 for s in kernel_size], device=dev, dtype=dtype)
     grid = torch.stack(torch.meshgrid([torch.arange(s)
-                                       for s in kernel_size]), dim=0).view(len(kernel_size), -1).T # center on each index
-    dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=cov)
+                                       for s in kernel_size]), dim=0).view(len(kernel_size), -1).T.to(dev) # center on each index
+    for i in range(5):
+        try:
+            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=cov)
+            break
+        except ValueError as e:
+            print("WARN:", e, "\n Attempting to fix by add identity...")
+            cov = cov + torch.eye(2) * .01
+            if i == 4:
+                raise ValueError
+
     # get some samples to construct prob estimate
     locs = torch.stack(torch.meshgrid([torch.arange(integral_resolution)
-                                       for _ in kernel_size]), dim=0).view(len(kernel_size), -1).T.float()
+                                       for _ in kernel_size]), dim=0).view(len(kernel_size), -1).T.float().to(dev)
     if integral_resolution == 1:
         # should sample from middle of intervals if only doing one sampling
         locs += .5
@@ -62,6 +88,7 @@ def return_from_reward(rewards, gamma):
 
 def is_converged(loss_history, abs_tol=.00001, consider=100):
     """
+    Legacy, use adam / SGDM momentum threshold to estimate convergence.
     A heuristic metric of whether a model has converged
     :param loss_history:
     :param abs_tol: if provided overides rel_tol.
@@ -228,7 +255,7 @@ def triu_to_square(triu_vector, n, includes_diag=False):
         offset = 0
     else:
         offset = 1
-    adj = torch.zeros((n, n), dtype=torch.float)
+    adj = torch.zeros((n, n), dtype=triu_vector.dtype, device=triu_vector.device)
     ind = torch.triu_indices(n, n, offset=offset)
     adj[ind[0], ind[1]] = triu_vector
     adj = (adj.T + adj)
