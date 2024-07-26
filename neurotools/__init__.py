@@ -1,4 +1,4 @@
-from neurotools import modules, models, util, environments, embed, decoding, geometry
+from neurotools import modules, models, util, environments, embed, decoding, geometry, support
 
 
 def __version__():

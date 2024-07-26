@@ -340,9 +340,10 @@ class SearchlightDecoder:
             self.weights.append(torch.nn.Parameter(weights))
             all_spatials.append(step)
         self.bias = torch.empty(self.in_spatial, device=device)
+        self.bias = torch.nn.init.xavier_normal_(self.bias)
         # setup optimization scheme
         self.optim = torch.optim.Adam(self.weights + [self.bias], lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,2500, .1)  # reduce the maximum learning rate every step epochs
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,1250, .1)  # reduce the maximum learning rate every step epochs
         self.out_spatials = all_spatials[1:]
         self.class_weights = torch.ones((n_classes, int(np.prod(self.out_spatials[-1]))), device=device)  # modified if reweight is enabled
         ce = torch.nn.CrossEntropyLoss()
