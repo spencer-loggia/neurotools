@@ -5,9 +5,9 @@ import numpy as np
 import networkx as nx
 
 
-def logistic_func(input_x, initial, final, log_tau):
+def exponential_func(input_x, initial, final, log_tau):
     """
-    returns a logistic function positioned such that always equals initial when input is 0.
+    returns a exponential function positioned such that always equals initial when input is 0 and -> final as input -> inf
     Final must be greater than initial
     Args:
         initial:
@@ -23,10 +23,10 @@ def logistic_func(input_x, initial, final, log_tau):
     initial = initial.unsqueeze(0)
     # solve for x_o
     d = final - initial
-    # compute logistic
+    # compute exp
     exponent = -tau * input_x
-    denom = 1 + torch.exp(exponent)
-    return (2 * d / denom) - d + initial
+    exponential = 1 - torch.exp(exponent)
+    return d * exponential + initial
 
 
 def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, renormalize=False):
