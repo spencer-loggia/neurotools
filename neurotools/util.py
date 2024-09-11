@@ -3,11 +3,87 @@ import math
 import torch
 import numpy as np
 import networkx as nx
+import pandas as pd
+
+
+def balance_classes(df, class_col, n=None):
+    """
+    Funtion that takes a data frame with class labels in provided column, then generates a new one with n examples
+    of each class under the following constraints:
+    1. When examples of a class need to be duplicated, all examples should be duplicated i times before any is
+    duplicated i + 1 times.
+    2. given c classes, if c_j is at index 0 <= i < n, the next allowed index for c_j is i + |c|. i.e. all classes are
+    listed before repeating, or classes are listed in a repeating cycles
+    3. independent instances of a class (respective of duplication) are interleaved in the resulting dataframe
+    Args:
+        df:
+        column_name:
+        n:
+
+    Returns:
+
+    """
+    # Ensure valid input
+    if class_col not in df.columns:
+        raise ValueError(f"Column '{class_col}' not found in DataFrame.")
+
+    # Get unique classes
+    classes = df[class_col].unique()
+    if n is None:
+        class_counts = df[class_col].value_counts()
+        n = class_counts.max()
+    if n <= 0:
+        raise ValueError("The value of n must be greater than 0.")
+    # DataFrame to hold the balanced data
+    balanced_data = []
+
+    # Process each class
+    for class_label in classes:
+        class_df = df[df[class_col] == class_label]
+        current_count = len(class_df)
+
+        # how many times to repeat the rows to reach n
+        if current_count < n:
+            repeat_times = -(-n // current_count)
+            class_df = pd.concat([class_df] * repeat_times, ignore_index=True).head(n)
+        elif current_count == n:
+            class_df = class_df.reset_index(drop=True)
+        else:
+            class_df = class_df.sample(n=n, replace=False).reset_index(drop=True)
+
+        balanced_data.append(class_df)
+
+    # Combine all class dataframes
+    balanced_df = pd.concat(balanced_data, ignore_index=False).sort_index().reset_index(drop=True)
+    return balanced_df
+
+
+def positional_encode(positions, ndim):
+    """
+    Args:
+        positions: [int, Tensor] Takes either an integer number of positions n or tensor of positions of length n
+        dim: dimmensionality of encoding
+
+    Returns: <n, 1, dim> Tensor of positional encodings
+    """
+    dim = ndim - 2
+    if type(positions) == int:
+        positions = torch.arange(positions)
+    positions = positions.unsqueeze(1).float()
+    r_positions = positions.unsqueeze(1)
+    l_positions = torch.log(r_positions + 1)
+    n = len(positions)
+    div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+    pe = torch.zeros(n, 1, dim)
+    pe[:, 0, 0::2] = torch.sin(positions * div_term)
+    pe[:, 0, 1::2] = torch.cos(positions * div_term)
+    pe = torch.cat([r_positions, l_positions, pe], dim=2)
+    return pe
 
 
 def exponential_func(input_x, initial, final, log_tau):
     """
-    returns a exponential function positioned such that always equals initial when input is 0 and -> final as input -> inf
+    returns an exponential function positioned such that always equals initial when input is 0 and -> final as input -> inf
     Final must be greater than initial
     Args:
         initial:
@@ -29,8 +105,20 @@ def exponential_func(input_x, initial, final, log_tau):
     return d * exponential + initial
 
 
-def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, renormalize=False):
-    cov=cov.squeeze()
+def gaussian_kernel(kernel_size: tuple, cov: torch.Tensor, integral_resolution=3, renormalize=False):
+    """
+    A differentiable 2D gaussian kernel! could be easily extended to higher dims. USeful if you want to learn paremeters
+    of a distribution that will be convolved over some space.
+    Args:
+        kernel_size:
+        cov:
+        integral_resolution:
+        renormalize:
+
+    Returns:
+
+    """
+    cov = cov.squeeze()
     dev = cov.device
     dtype = cov.dtype
     if cov.ndim != 2:
@@ -40,7 +128,8 @@ def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, 
 
     mu = torch.tensor([s / 2 for s in kernel_size], device=dev, dtype=dtype)
     grid = torch.stack(torch.meshgrid([torch.arange(s)
-                                       for s in kernel_size]), dim=0).view(len(kernel_size), -1).T.to(dev) # center on each index
+                                       for s in kernel_size]), dim=0).view(len(kernel_size), -1).T.to(
+        dev)  # center on each index
     for i in range(5):
         try:
             dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=cov)
@@ -65,6 +154,35 @@ def gaussian_kernel(kernel_size:tuple, cov:torch.Tensor, integral_resolution=3, 
     if renormalize:
         probs = probs / torch.sum(probs)
     return probs.view((kernel_size))
+
+
+def affine_from_params(rotations=(0, 0, 0), scale=(1, 1, 1), translate=(0, 0, 0)):
+    """
+    generates a 4d affine transfrom matrix given rotation [deg], scale, and translation arguments
+    Returns:
+    ndarry size 4, 4
+    """
+    scale_mat = np.zeros((3, 3), dtype=float)
+    # set diagonal
+    scale_mat[np.diag_indices(3)] = np.array(scale, dtype=float)
+    # rotation mats
+    rotations = np.deg2rad(np.array(rotations))
+    x_rot = np.eye(3, dtype=float)
+    x_rot[1:, 1:] = np.array([[np.cos(rotations[0]), np.sin(rotations[0])],
+                              [-np.sin(rotations[0]), np.cos(rotations[0])]])
+    y_rot = np.eye(3, dtype=float)
+    y_rot[(0, 0, 2, 2), (0, 2, 0, 2)] = np.array([np.cos(rotations[1]), -np.sin(rotations[1]),
+                                                  np.sin(rotations[1]), np.cos(rotations[1])])
+    z_rot = np.eye(3, dtype=float)
+    z_rot[:2, :2] = np.array([[np.cos(rotations[2]), -np.sin(rotations[2])],
+                              [np.sin(rotations[2]), np.cos(rotations[2])]])
+    # scale and rot
+    affine_3 = scale_mat @ x_rot @ y_rot @ z_rot
+    # create 4d affine
+    affine = np.eye(4, dtype=float)
+    affine[:3, :3] = affine_3
+    affine[:3, 3] = np.array(translate)
+    return affine
 
 
 def return_from_reward(rewards, gamma):
@@ -141,6 +259,8 @@ def conv_identity_params(in_spatial, desired_kernel, stride=1):
 
 
 def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatial_dims: int, stride=1):
+    """ explicitly represents a kernel passed over a space of arbitrary dimensionality. Fixes torch unfold not working
+    with more than 2 dims. Useful for arbitrary multidimensional convolutional operations"""
     pad = [padding] * (2 * spatial_dims)
     batch_size = input_tensor.shape[0]
     channel_size = input_tensor.shape[1]
@@ -160,7 +280,7 @@ def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatia
 
 def pearson_correlation(x1: torch.Tensor, x2: torch.Tensor, dim=0):
     """
-    compute pearson correlation between two vectors.
+    compute pearson correlation between two vectors in a batched torch friendly wway.
     :param x1: vector1 of size n
     :param x2: vector2 of same size n
     :param dim: if ndims > 1, dimension to compute corr along.
@@ -178,6 +298,7 @@ def pearson_correlation(x1: torch.Tensor, x2: torch.Tensor, dim=0):
 
 
 def _get_ranks(x: torch.Tensor) -> torch.Tensor:
+    "spearman helper"
     tmp = x.argsort()
     ranks = torch.zeros_like(tmp)
     ranks[tmp] = torch.arange(len(x))
@@ -185,7 +306,7 @@ def _get_ranks(x: torch.Tensor) -> torch.Tensor:
 
 
 def spearman_correlation(x: torch.Tensor, y: torch.Tensor):
-    """Compute spearman correlation between 2 1-D vectors
+    """Compute spearman correlation between 2 1-D vectors in a torch (read gradient) friendly way
     Args:
         x: Shape (N, )
         y: Shape (N, )
