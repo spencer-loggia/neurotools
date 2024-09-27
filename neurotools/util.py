@@ -1,9 +1,12 @@
 import math
+from typing import List, Union
 
 import torch
 import numpy as np
 import networkx as nx
 import pandas as pd
+from scipy import stats
+import itertools
 
 
 def balance_classes(df, class_col, n=None):
@@ -56,6 +59,36 @@ def balance_classes(df, class_col, n=None):
     # Combine all class dataframes
     balanced_df = pd.concat(balanced_data, ignore_index=False).sort_index().reset_index(drop=True)
     return balanced_df
+
+
+def atlas_from_list(masks: List[np.ndarray], names: List, thresh=.5):
+    """
+    Create an atlas and lookup file from a list of arrays thresholded at thresh. If two masks overlap, will add
+    those indexes to "tie-break" label.
+    Args:
+        masks: list of masks for different labels
+        names: list of names for each label
+        thresh: where to threshold background on mask
+    Returns: Atlas: np.ndarrray type int, Lookup: pd.DataFrame
+    """
+    # create atlas
+    masks = [np.zeros_like(masks[0])] + masks # add background
+    masks = np.stack(masks, axis=0)
+    masks = masks > thresh
+    tie = (np.sum(masks, axis=0) > 1)
+    atlas = np.argmax(masks, axis=0) # 0 needs to indicate background
+    atlas[tie] = len(names)
+    padded = np.pad(atlas, 1)
+    for t in np.argwhere(tie):
+        # iterate over ties and replace with nearest
+        arr = padded[t[0]-1+1:t[0]+2+1,
+                  t[1]-1+1:t[1]+2+1,
+                  t[2]-1+1:t[2]+2+1]
+        arr = arr[np.nonzero(arr)]
+        l = stats.mode(arr.flatten()).mode
+        atlas[t[0], t[1], t[2]] = l
+    names = names + ["tie"]
+    return atlas, names
 
 
 def positional_encode(positions, ndim):
@@ -211,23 +244,31 @@ def return_from_reward(rewards, gamma):
     return returns
 
 
-def is_converged(loss_history, abs_tol=.00001, consider=100):
+def is_converged(loss_history, optim, batch_size, t):
     """
     Legacy, use adam / SGDM momentum threshold to estimate convergence.
     A heuristic metric of whether a model has converged
     :param loss_history:
-    :param abs_tol: if provided overides rel_tol.
-    :param rel_tol: fraction of initial loss to consider as convergence tolerance.
-    :param consider: amount of previous loss examples to consider
     :return:
     """
-    if len(loss_history) < consider:
-        return False
-    loss_history = torch.Tensor(loss_history)
-    if (loss_history[(-1 * (consider - 1)):]).std() < abs_tol:
-        return True
-    else:
-        return False
+    check_size = (2000 // batch_size)
+    if ((t + 1) % check_size) == 0:
+        # reduce learn rate if not improving and check to stop early...
+        d_last_block = np.mean(np.array(loss_history[-3*check_size:-2*check_size]))
+        last_block = np.mean(np.array(loss_history[-2*check_size:-1*check_size]))
+        block = np.mean(np.array(loss_history[-1*check_size:]))
+        lr = 0.
+        for g in optim.param_groups:
+            lr = g['lr']
+            print("LR:", lr)
+            if t > 2*check_size and block > last_block:
+                # cool down on plateu
+                g['lr'] = g['lr'] * .1
+            elif t > 3*check_size and block < last_block < d_last_block:
+                # reheat on slope
+                g['lr'] = min(g['lr'] * 8.0, .01)
+        print("EPOCH", t, "LOSS", block)
+    return optim
 
 
 def conv_identity_params(in_spatial, desired_kernel, stride=1):
@@ -258,15 +299,18 @@ def conv_identity_params(in_spatial, desired_kernel, stride=1):
     return kernel + 1, int(pad)
 
 
-def unfold_nd(input_tensor: torch.Tensor, kernel_size: int, padding: int, spatial_dims: int, stride=1):
+def unfold_nd(input_tensor: torch.Tensor, kernel_size: Union[int, tuple[int]],
+              padding: Union[int, tuple[int]], spatial_dims: int, stride=1):
     """ explicitly represents a kernel passed over a space of arbitrary dimensionality. Fixes torch unfold not working
     with more than 2 dims. Useful for arbitrary multidimensional convolutional operations"""
-    pad = [padding] * (2 * spatial_dims)
+    pad = list(itertools.chain(*[[padding[i]] * 2 for i in range(spatial_dims)]))  # abstract pad to both sides of input
+    # Assumes torch batch and channel placement (e.g. <b, c, ...>)
     batch_size = input_tensor.shape[0]
     channel_size = input_tensor.shape[1]
+    # pad input.
     padded = torch.nn.functional.pad(input_tensor, pad, "constant", 0)
     for i in range(spatial_dims):
-        padded = padded.unfold(dimension=2 + i, size=kernel_size, step=stride)
+        padded = padded.unfold(dimension=2 + i, size=kernel_size[i], step=stride)
     kernel_channel_dim = channel_size
     spatial_flat_dim = 1
     for i in range(spatial_dims):
@@ -344,19 +388,23 @@ def _pad_to_cube(arr: np.ndarray, time_axis=3):
     return arr
 
 
-def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=5):
+def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=0):
     """
     converts a matrix and corresponding atlas, to a list with data for each class
-    :param data_matrix:
+    :param data_matrix: matrix of data. May have a batch dimension.
     :param atlas:
     :param ignore_atlas_base: If true, will not create a list entry for items labelled 0 in the atlas.
     :param min_dim: minimum number of datapoint necessary to include an atlas entry
     :return: list of tensors, atlas label that each entry corresponds to.
     """
+    if atlas is None:
+        atlas = data_matrix
     if type(data_matrix) is np.ndarray:
         data_matrix = torch.from_numpy(data_matrix)
     if type(atlas) is np.ndarray:
         atlas = torch.from_numpy(atlas)
+    if data_matrix.ndim == atlas.ndim:
+        data_matrix = data_matrix.unsqueeze(0)
     atlas = atlas.int()
     unique = torch.unique(atlas)
     unique_filtered = []
@@ -364,9 +412,9 @@ def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=5):
     for roi_id in unique:
         if ignore_atlas_base and roi_id == 0:
             continue
-        data = data_matrix[atlas == roi_id].unsqueeze(0)
+        data = data_matrix[..., atlas == roi_id]
         if data.shape[1] > min_dim:
-            unique_filtered.append(roi_id)
+            unique_filtered.append(roi_id.detach().cpu().item())
             class_data_list.append(data)
     return class_data_list, unique_filtered
 

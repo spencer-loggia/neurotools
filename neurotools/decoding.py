@@ -2,7 +2,7 @@ import copy
 import datetime
 import math
 import os
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 
 import numpy as np
 import torch
@@ -12,19 +12,20 @@ from matplotlib import pyplot as plt
 import pickle as pk
 from neurotools import util
 import sys
+
 try:
     from captum.attr import DeepLift
 except Exception:
     print("Captum module not found, deeplift attribution method not available")
 
 
-def compute_acc(y, yhat):
+def compute_acc(y, yhat, top=1):
     """
     :param y: 1d of target class labels
     :param yhat: 2d of class scores
     :return:
     """
-    correct = torch.argmax(yhat, dim=1).int() == y
+    correct = (torch.argsort(yhat, dim=1)[:, -top:].int() == y.view(-1, 1)).sum(dim=1)
     acc = 100 * torch.count_nonzero(correct) / len(y)
     return acc.detach().cpu().item()
 
@@ -46,7 +47,7 @@ class GlobalMultiStepCrossDecoder:
 
     def __init__(self, decoder: Union[torch.nn.Module, tuple], smooth_kernel_size: int, input_spatial: tuple,
                  input_channels: int, force_mask: torch.Tensor, name: str, n_sets=2, device="cuda", lr=.01,
-                 set_names=("shape", "color"), unify_fit=False):
+                 set_names=("shape", "color"), unify_fit=False, sigmoid_mask=True):
         if isinstance(decoder, torch.nn.Module):
             decoder = [decoder]
             print("Using single decoder for all modalities.")
@@ -68,11 +69,12 @@ class GlobalMultiStepCrossDecoder:
         self.name = name
         self._reset_mask()
         self.smooth_kernel = self._create_smoothing_kernel(self.smooth_kernel_size)
+        self.sigmoid_mask = sigmoid_mask
         if force_mask is None:
             self.force_mask = torch.ones_like(self.mask_base[0][0])
         else:
-            self.force_mask = force_mask.to(self.device).reshape((1, 1) + force_mask.shape)
-        if unify_fit:
+            self.set_force_mask(force_mask)
+        if not unify_fit:
             self.decode_optim = [torch.optim.Adam(lr=lr, params=d.parameters()) for d in self.decoder]
         else:
             # train mask with in decoder, assumes cross regions will be subset of in regions, probably valid
@@ -89,14 +91,18 @@ class GlobalMultiStepCrossDecoder:
         if not hasattr(self, "lr"):
             self.lr = .01
         # initial mask is set such as to be in the unstable regime of loss function + regularizer
-        self.mask_base = [[torch.nn.Parameter(torch.normal(size=(1, 1) + self.spatial, mean=0., std=.1, device=self.device)) for
-                           _ in range(self.n_sets)] for _ in range(self.n_sets)]
+        self.mask_base = [
+            [torch.nn.Parameter(torch.normal(size=(1, 1) + self.spatial, mean=0., std=.1, device=self.device)) for
+             _ in range(self.n_sets)] for _ in range(self.n_sets)]
         self.mask_optim = [[torch.optim.Adam(lr=.1, params=[m]) for m in set_masks] for set_masks in
                            self.mask_base]
 
+    def set_force_mask(self, mask):
+        self.force_mask = mask.to(self.device).reshape((1, 1) + mask.shape)
+
     def _create_smoothing_kernel(self, kernel_size):
         # Create the Gaussian kernel
-        sigma = kernel_size / 4
+        sigma = 1.  # kernel_size / 6
         if self.spatial_dims == 2:
             kernel = np.zeros((kernel_size, kernel_size))
             kernel[kernel_size // 2, kernel_size // 2] = 1
@@ -127,16 +133,21 @@ class GlobalMultiStepCrossDecoder:
 
     def get_mask(self, mask_base, noise=True, reg=False, use_smooth=True):
         # takes -inf, inf input to range 0, 1. Maintains desirable gradient characteristics.
-        s_gain = mask_base * self.force_mask
+        s_gain = mask_base
         if noise:
             s_gain = s_gain + torch.normal(0., .01, size=s_gain.shape, device=self.device)
         if use_smooth:
             s_gain = self.gaussian_smoothing(s_gain)
-        final_mask = torch.sigmoid(s_gain)
-        if reg:
-            return final_mask, 1 * torch.mean(torch.abs(s_gain + 3))
+        l_mask = s_gain * self.force_mask
+        if hasattr(self, "sigmoid_mask") and self.sigmoid_mask:
+            final_mask = torch.sigmoid(l_mask)
+            if reg:
+                return final_mask, 1 * torch.mean(torch.abs(s_gain + 3))
         else:
-            return final_mask
+            final_mask = l_mask
+            if reg:
+                return final_mask, 1 * torch.mean(torch.abs(s_gain))
+        return final_mask
 
     def decode_step(self, decoder, in_train, mask):
         # preform a decoding step and return cross-entropy loss value.
@@ -246,13 +257,17 @@ class GlobalMultiStepCrossDecoder:
                         decode_optim = self.decode_optim[0]
                     decoder.train()
                     set_mask = self.mask_base[i][i]
-                    in_mask, reg = self.get_mask(set_mask, noise=True, reg=True)
+                    if self.unify_fit:
+                        in_mask, reg = self.get_mask(set_mask, noise=True, reg=True)
+                    else:
+                        in_mask = torch.ones_like(set_mask)
+                        reg = torch.tensor([0.])
                     decode_loss, acc = self.decode_step(decoder, dset, in_mask)
                     l2loss = .01 * torch.mean(
                         torch.stack([torch.mean(torch.pow(param.data.flatten(), 2)) for param in decoder.parameters()]))
                     print(epoch, "MODEL LOSS:", decode_loss.detach().cpu().item(), "ACC", acc, "(REG:",
                           l2loss.detach().cpu().item(), "MASK REG:", reg.detach().cpu().item(), ")")
-                    loss = decode_loss + l2loss + .00001 * reg # add reg penalty and ver small mask penalty
+                    loss = decode_loss + l2loss
                     histories[i].append(loss.cpu().detach().item())
                     check_size = (2000 // batch_size) + 1
                     if ((epoch + 1) % check_size) == 0:
@@ -264,14 +279,15 @@ class GlobalMultiStepCrossDecoder:
                         for g in decode_optim.param_groups:
                             lr = g['lr']
                             print("LR:", lr)
-                            if epoch > 2*check_size and block > last_block:
+                            if epoch > 2 * check_size and block > last_block:
                                 # cool down on plateu
                                 g['lr'] = g['lr'] * .1
-                            elif epoch > 3*check_size and block < last_block < d_last_block:
+                            elif epoch > 3 * check_size and block < last_block < d_last_block:
                                 # reheat on slope
                                 g['lr'] = min(g['lr'] * 2.5, .01)
                     loss.backward()
-                    print(torch.max(set_mask.grad), torch.min(set_mask.grad))
+                    if self.unify_fit:
+                        print(torch.max(set_mask.grad), torch.min(set_mask.grad))
                     decode_optim.step()
                     decode_optim.zero_grad()
 
@@ -287,7 +303,7 @@ class GlobalMultiStepCrossDecoder:
         for i in range(self.n_sets):
             X.resample = False
             if self.unify_fit:
-                mask_iters = iters
+                mask_iters = (iters // 2) + 1
                 # if train mask was updated during fit, we initialize the cross set mask to it.
                 for j in range(len(self.mask_base[i])):
                     if j != i:
@@ -297,7 +313,9 @@ class GlobalMultiStepCrossDecoder:
                 # need more iters for mask if  starting randomly
                 mask_iters = iters
             X.epochs = mask_iters
+            X.mode = "dev"
             local_loss, local_acc = self._fit(X, i, iters=mask_iters)
+            X.mode = "train"
             for j in range(self.n_sets):
                 self.loss_histories[i][j] += local_loss[j]
                 self.accuracies[i][j] += local_acc[j]
@@ -368,6 +386,7 @@ class GlobalMultiStepCrossDecoder:
             ref: list of refs for each set. Often should be the mean of all classes, defaults to 0
         Returns:
         """
+
         # need to formulate as pytorch module for DeepLift algo
         class _DecodeModule(torch.nn.Module):
             def __init__(self, decoder, mask, *args, **kwargs):
@@ -380,6 +399,7 @@ class GlobalMultiStepCrossDecoder:
                 h = input * self.mask
                 yhat = self.decoder(h)
                 return yhat
+
         print("Running DeepLift Attribution...")
         # list to hold each iteration's input gradients
         sal_map = [[] for _ in range(self.n_sets)]
@@ -457,22 +477,26 @@ class SearchlightDecoder:
             self.out_channels = n_classes
         self.lr = lr
         self.nonlinear = nonlinear
-        self.pad = pad
+        if type(pad) == int:
+            self.pad = [pad] * num_layer
+        else:
+            self.pad = pad
         self.channels = channels
-        hc = [math.ceil(2 * math.log10(n_classes)) * max(c, 1) for c in range(hidden_channels, hidden_channels - num_layer + 1, -1)]
+        hc = [math.ceil(2 * math.log10(n_classes)) * max(c, 1) for c in
+              range(hidden_channels, hidden_channels - num_layer + 1, -1)]
         self.all_channels = [channels] + hc + [self.out_channels]
         self.reg_coef = reg
         self.weights = []
         all_spatials = [np.array(self.in_spatial)]
         # compute the weight dimensions for each layer.
         for i in range(num_layer):
-            step = (((all_spatials[-1] - self.kernel[i] + 2 * pad) / stride) + 1).astype(int)
+            step = (((all_spatials[-1] - self.kernel[i] + 2 * self.pad[i]) / stride) + 1).astype(int)
             # weights for each filter in this layer. (spatial, c_in * kernel, c_out)
             weight_shape = (int(np.prod(step)),
                             self.all_channels[i] * (self.kernel[i] ** self.dim),
                             self.all_channels[i + 1])
             # initialize weights following xavier protocol
-            weights = torch.empty(weight_shape, dtype=torch.double, device=device)
+            weights = torch.empty(weight_shape, dtype=torch.float, device=device)
             weights = torch.nn.init.xavier_uniform(weights)
             # track weights as torch Parameters
             self.weights.append(torch.nn.Parameter(weights))
@@ -513,13 +537,14 @@ class SearchlightDecoder:
         Returns: torch.Tensor, size(batch, classes, out_spatial) class logits for each example at each point in space
 
         """
-        stim = torch.from_numpy(stim).double().to(self.device)
+        if type(stim) is np.ndarray:
+            stim = torch.from_numpy(stim).float().to(self.device)
         batch_size = stim.shape[0]
         h = stim + self.bias.view((1, 1) + self.in_spatial)
         iterrule = "bks,skc->bcs"
         # unfold, apply weights, and refold in sequence.
         for i in range(len(self.weights)):
-            ufld_stim = util.unfold_nd(h, self.kernel[i], self.pad, self.dim,
+            ufld_stim = util.unfold_nd(h, self.kernel[i], self.pad[i], self.dim,
                                        self.stride)  # batch size (b), kernel dims (k), spatial dims (s),
             if self.std_mode == "spatial":
                 # designed to eliminate differences in signal intensity as a source of error, idk might not work at all.
@@ -561,15 +586,16 @@ class SearchlightDecoder:
                 # convert targets to tensors
                 target = torch.from_numpy(target)
                 target = target.long().to(self.device).reshape([-1] + [1] * self.dim)
-                targets = torch.tile(target, [1] + list(self.out_spatials[-1])) # <b, 1, s1, s2, s3>
+                targets = torch.tile(target, [1] + list(self.out_spatials[-1]))  # <b, 1, s1, s2, s3>
                 batch_size = len(target)
                 # compute class logits and unflatten spatial dimensions
-                y_hat = self.step(stim).reshape(([batch_size, self.n_classes] + list(self.out_spatials[-1])))  # <b, c, s1, s2, s3>
+                y_hat = self.step(stim).reshape(
+                    ([batch_size, self.n_classes] + list(self.out_spatials[-1])))  # <b, c, s1, s2, s3>
                 yhat_all.append(y_hat.detach().cpu())
                 targets_all.append(target.flatten().detach().cpu().numpy())
 
                 # compute cross entropy and average across examples
-                loss = loss_fxn(y_hat.permute((0, 2, 3, 4, 1)).reshape((-1, y_hat.shape[1])),
+                loss = loss_fxn(torch.movedim(y_hat, 1, -1).reshape((-1, y_hat.shape[1])),
                                 targets.flatten()).reshape(targets.shape)
                 loss = loss.mean(dim=0)
                 # compute class prediction and batch accuracy
@@ -608,6 +634,26 @@ class SearchlightDecoder:
             # return averages across batches.
         return acc_tracker / count, ce_tracker / count
 
+    def loss_reweight(self, y_hat, target, loss):
+        # prevents easy to classify class from dominating training dynamics.
+        # loss is per spacial index
+        with torch.no_grad():
+            pred = torch.argmax(y_hat, dim=1)
+            for j in range(self.n_classes):
+                c_dex = torch.nonzero(target.flatten() == j).reshape((-1))
+                # class weight moves toward local class weight from this class
+                if len(c_dex) != 0:
+                    class_acc = 1 - ((torch.count_nonzero(pred[c_dex, :] == target[c_dex, :], dim=0)) / (
+                            6 * len(c_dex)))
+                    diff_from_chance = (self.class_weights[j, :] - class_acc)
+                    self.class_weights[j, :] = self.class_weights[j, :] - (
+                            .04 * len(c_dex) * diff_from_chance[None, :])
+                # relative class importance changes, but overall magnitude stays the same.
+                self.class_weights = self.n_classes * self.class_weights / torch.sum(self.class_weights, dim=0)[
+                                                                           None, :]
+                loss[c_dex, :] = loss[c_dex, :] * self.class_weights[j, :][None, :]
+                return loss
+
     def fit(self, dataloader):
         """
         fit the layered searchlight model.
@@ -632,42 +678,391 @@ class SearchlightDecoder:
             loss = loss_fxn(y_hat.transpose(1, 2).reshape((-1, y_hat.shape[1])),
                             targets.flatten()).reshape(targets.shape)
             if self.reweight:
-                # prevents easy to classify class from dominating training dynamics.
-                with torch.no_grad():
-                    pred = torch.argmax(y_hat, dim=1)
-                    for j in range(self.n_classes):
-                        c_dex = torch.nonzero(target.flatten() == j).reshape((-1))
-                        # class weight moves toward local class weight from this class
-                        if len(c_dex) != 0:
-                            class_acc = 1 - ((torch.count_nonzero(pred[c_dex, :] == target[c_dex, :], dim=0)) / (
-                                        6 * len(c_dex)))
-                            diff_from_chance = (self.class_weights[j, :] - class_acc)
-                            self.class_weights[j, :] = self.class_weights[j, :] - (
-                                        .04 * len(c_dex) * diff_from_chance[None, :])
-                        # relative class importance changes, but overall magnitude stays the same.
-                        self.class_weights = self.n_classes * self.class_weights / torch.sum(self.class_weights, dim=0)[
-                                                                                   None, :]
-                        loss[c_dex, :] = loss[c_dex, :] * self.class_weights[j, :][None, :]
+                loss = self.loss_reweight(y_hat, targets, loss)
+
             # collapse loss
             loss = torch.sum(loss) + self.reg_coef * l2_penalty  # (1)
             self.loss_history.append(loss.detach().cpu().item())
-            if ((i + 1) % (2000 // batch_size)) == 0:
-                # reduce learn rate if not improving and check to stop early...
-                d_last_block = np.mean(np.array(self.loss_history[-300:-200]))
-                last_block = np.mean(np.array(self.loss_history[-200:-100]))
-                block = np.mean(np.array(self.loss_history[-100:]))
-                lr = 0.
-                for g in self.optim.param_groups:
-                    lr = g['lr']
-                    print("LR:", lr)
-                    if i > 200 and block > last_block:
-                        # cool down on plateu
-                        g['lr'] = g['lr'] * .1
-                    elif i > 300 and block < last_block < d_last_block:
-                        # reheat on slope
-                        g['lr'] = min(g['lr'] * 2.5, .01)
-                print("EPOCH", i, "LOSS", block)
+            util.is_converged(self.loss_history, self.optim, batch_size, i)
             # apply gradients
             loss.backward()
             self.optim.step()
             self.scheduler.step()
+
+
+class VarConvND(torch.nn.Module):
+    def __init__(self, kernel_size: Union[tuple[int], int], padding: Union[tuple[int], int], in_channels: int,
+                 out_channels: int, spatial: Union[tuple[int], int], ndims=2, stride=1, bias=True, device="cpu",
+                 dtype=torch.float, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # weight (spatial, c_in * kernel, c_out)
+        self.spatial = spatial
+        self.padding = padding
+        self.kernel_size = kernel_size
+        if type(kernel_size) is int:
+            self.kernel_size = (kernel_size,)*ndims
+        if type(spatial) is int:
+            self.spatial = (spatial,)*ndims
+        if type(padding) is int:
+            self.padding = (padding,)*ndims
+        self.device = device
+        self.stride = stride
+        self.ndims = ndims
+        self.use_bias = bias
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        s = np.array(self.spatial)
+        k = np.array(self.kernel_size)
+        p = np.array(self.padding)
+        # compute input spatial after pad and stride
+        in_spatial: np.ndarray = (((s - k + 2 * p) / stride) + 1).astype(int)
+        weight_shape = (int(np.prod(in_spatial)),
+                        in_channels * np.prod(k),
+                        out_channels)
+        self.in_spatial: list = in_spatial.tolist()
+        # initialize weights following xavier protocol
+        weights = torch.empty(weight_shape, dtype=dtype, device=device)
+        weights = torch.nn.init.xavier_uniform(weights)
+        # track weights as torch Parameters
+        self.weight = torch.nn.Parameter(weights)
+        if bias:
+            bias = torch.empty(size=self.in_spatial, dtype=dtype, device=device)
+            bias = torch.nn.init.xavier_uniform(bias)
+            # track weights as torch Parameters
+            self.bias = torch.nn.Parameter(bias)
+
+
+    def forward(self, X):
+        batch_size = X.shape[0]
+        ufld_x = util.unfold_nd(X, kernel_size=self.kernel_size, spatial_dims=self.ndims,
+                                padding=self.padding, stride=self.stride)
+        if self.use_bias:
+            ufld_x = ufld_x + self.bias.view((1, 1, -1))
+        iterrule = "bks,skc->bcs"
+        # mapping input kernel to out channels in next layer for each example for each location in space,
+        h = torch.einsum(iterrule, ufld_x, self.weight)  # batch (b), hidden channels, spatial (s)
+        # fold to next layer.
+        h = h.view([batch_size, self.out_channels] + self.in_spatial)
+        return h
+
+def hardmax(X, dim=1):
+    inds = torch.argmax(X, dim=1)
+    new = torch.zeros_like(X)
+    new[inds] = 1.
+    return new
+
+class ROISearchlightDecoder():
+    """
+    Seperate masking decoder for each ROI
+    """
+    def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str],
+                 nonlinear=True, spatial=(64, 64, 64), in_channels=2, n_classes=2, device="cuda",
+                 share_conv=False):
+        self.atlas = atlas
+        self.lookup = lookup
+        self.roi_names = list(self.lookup.values())
+        self.num_rois = len(self.lookup)
+        self.set_names = set_names
+        self.dim = len(spatial)
+        self.in_spatial = spatial
+        self.n_classes = n_classes
+        self.pad = [0, 1]
+        self.channels = in_channels
+        self._train_set = set_names[0]
+        self._train_model = True
+        self._train_mask = True
+        self.lin_reg_coef = 0.0
+        self.spatial_reg_coef = 0.0
+        self.share_conv = share_conv
+        self.device = device
+        base_chan = math.ceil(.5 * np.log(self.n_classes)) * 2**self.dim
+        if self.dim == 2:
+            ConvConstr = torch.nn.Conv2d
+        else:
+            ConvConstr = torch.nn.Conv3d
+
+        self.conv_2 = VarConvND(in_channels=2 ** self.dim, out_channels=2 * base_chan, kernel_size=2,
+                                padding=self.pad[0],
+                                spatial=tuple(s + 1 for s in self.in_spatial), ndims=self.dim, bias=True,
+                                dtype=torch.float, device=self.device)
+        self.conv_1 = ConvConstr(in_channels=in_channels, out_channels=2 ** self.dim, kernel_size=2,
+                                 padding=self.pad[1],
+                                 dtype=torch.float, device=self.device, bias=False)
+        self.conv_3 = ConvConstr(in_channels=2 * base_chan, out_channels=n_classes, kernel_size=1, padding=0,
+                                 dtype=torch.float, device=self.device, bias=False)
+        self.search_dropout = torch.nn.Dropout(p=.4)
+        self.predictor_dropout = torch.nn.Dropout(p=0.4)
+        self.activation = torch.nn.LeakyReLU()
+        self._smooth_kernel_size = 5
+        self.smooth_kernel = self._create_smoothing_kernel(self._smooth_kernel_size)
+        # initialize weights from searchlights to rois
+        self.roi_weights = {}
+        self.total_features = 0
+        self.mask = np.zeros(self.in_spatial)
+        for roi_ind in self.lookup.keys():
+            roi = self.atlas==roi_ind
+            roi_size = np.count_nonzero(roi)
+            self.total_features += roi_size
+            self.mask[roi] = 1
+        self.mask = torch.from_numpy(self.mask).to(device).float()
+        self.global_weights = {}
+        self.temperatures = {}
+        for s in self.set_names:
+            weight = torch.ones(self.in_spatial, device=device)
+            weight = torch.nn.Parameter(weight)
+            self.roi_weights[s] = weight
+            weight = torch.empty((len(self.roi_weights),), device=self.device)
+            weight = torch.nn.Parameter(torch.nn.init.ones_(weight))
+            self.global_weights[s] = weight
+            self.temperatures[s] = torch.nn.Parameter(torch.tensor([1.], device=self.device))
+
+    def train_searchlight(self, set, on=True):
+        if set not in self.set_names:
+            raise ValueError
+        self._train_set = set
+        self._train_model = on
+
+    def train_predictors(self, set: str, on=True):
+        if set not in self.set_names:
+            raise ValueError
+        self._train_set = set
+        self._train_mask = on
+
+    def eval(self, set):
+        if set not in self.set_names:
+            raise ValueError
+        self._train_model = False
+        self._train_set = set
+        self._train_mask = False
+
+    def to(self, dev):
+        self.conv_1 = self.conv_1.to(dev)
+        self.conv_2 = self.conv_2.to(dev)
+        self.conv_3 = self.conv_3.to(dev)
+        for sk in self.set_names:
+            self.roi_weights[sk] = torch.nn.Parameter(self.roi_weights[sk].to(dev))
+        self.mask = self.mask.to(dev)
+        return self
+
+    def _create_smoothing_kernel(self, kernel_size):
+        # Create the Gaussian kernel
+        sigma = 0.75
+        if self.dim == 2:
+            kernel = np.zeros((kernel_size, kernel_size))
+            kernel[kernel_size // 2, kernel_size // 2] = 1
+            kernel = ndimage.gaussian_filter(kernel, sigma)
+
+        elif self.dim == 3:
+            kernel = np.zeros((kernel_size, kernel_size, kernel_size))
+            kernel[kernel_size // 2, kernel_size // 2, kernel_size // 2] = 1
+            kernel = ndimage.gaussian_filter(kernel, sigma)
+        else:
+            raise ValueError
+        kernel_tensor = torch.from_numpy(kernel).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        return kernel_tensor
+
+    def gaussian_smoothing(self, tensor, *args):
+        stride = 1  # self.smooth_kernel_size // 2
+        if self.dim == 3:
+            smoothed_tensor = conv3d(tensor, self.smooth_kernel, stride=stride, padding=self._smooth_kernel_size // 2)
+        elif self.dim == 2:
+            smoothed_tensor = conv2d(tensor, self.smooth_kernel, stride=stride, padding=self._smooth_kernel_size // 2)
+        else:
+            raise RuntimeError("Working dimensionality must be either 2 or 3")
+        if smoothed_tensor.shape[-self.dim:] != self.in_spatial:
+            upsampler = torch.nn.Upsample(size=self.in_spatial, mode="nearest")
+            smoothed_tensor = upsampler(smoothed_tensor)
+        return smoothed_tensor
+
+    def roi_step(self, spatial_logits, top30=False):
+        """
+        Get scores for each ROI
+        Args:
+            stim: <batch, c_in, s1, s2, s3>
+
+        Returns: dict roi logits
+        """
+        spatial_logits, labels = util.atlas_to_list(spatial_logits, self.atlas) # [<batch, cl, roi>, ..., <>]
+        spatial_weights = self.gaussian_smoothing(self.roi_weights[self._train_set].view((1, 1,) + self.in_spatial))
+        spatial_weights, w_labels = util.atlas_to_list(spatial_weights, self.atlas)
+        roi_logits = {}
+        for i, l in enumerate(self.lookup.keys()):
+            rlogits = spatial_logits[labels.index(l)]  # <batch, cl, roi>
+            rw = spatial_weights[w_labels.index(l)]
+            # get max perclass
+            n = self.lookup[l]
+            rstim = rlogits / torch.linalg.norm(rlogits, dim=1).unsqueeze(1)  # convert to probs, so we give equal initial weight to each loc
+            # rstim = torch.softmax(rlogits, dim=1)
+            ryhat = rstim * rw.view((1, 1, -1))  # batch, cl, roi
+            if top30:
+                sinds = torch.argsort(torch.max(ryhat, dim=1)[0].mean(dim=0))
+                ryhat = ryhat[:, :, sinds[-30:]]
+            roi_logits[n] = ryhat.sum(dim=2)
+        return roi_logits
+
+    def global_step(self, spatial_logits, top30=False):
+        """
+        Args:
+            stim: <batch, c_in, s1, s2, s3>
+        Returns: dist roi logits, global logits
+        """
+        batch_size = spatial_logits.shape[0]
+        weights = self.roi_weights[self._train_set]
+        weights = self.gaussian_smoothing(weights.view((1, 1,) + self.in_spatial))
+        if self._train_mask:
+            weights = self.predictor_dropout(weights)
+        spatial_logits = spatial_logits / torch.linalg.norm(spatial_logits, dim=1).unsqueeze(1)
+        # spatial_logits = torch.softmax(spatial_logits, dim=1)
+        spatial_logits = spatial_logits * weights
+        spatial_logits = spatial_logits.view((batch_size, self.n_classes, -1))
+        if top30:
+            sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
+            spatial_logits = spatial_logits[:, :, sinds[-30:]]
+        gyhat = spatial_logits.sum(dim=2) # / math.log(math.prod(self.in_spatial)) # batch, cl  * (self.global_weights[self._train_set]).view((1, 1, -1))
+        return gyhat
+
+    def shared_cov_step(self, stim):
+        if not self.share_conv:
+            raise ValueError("Not set in share conv mode. Run `step` instead.")
+        h = self.conv_1(stim)
+        h = self.activation(h)
+        if self._train_model:
+            h = self.search_dropout(h)
+        h = self.conv_2(h)
+        h = self.activation(h)
+        return self.conv_3(h)
+
+    def forward(self, stim, top30=False):
+        # compute regularization penalty
+        reg = torch.tensor([0.], device=self.device)
+        if self._train_model:
+            w_l2 = torch.sum(torch.stack([torch.mean(torch.pow(w.weight, 2))
+                                          for w in [self.conv_1, self.conv_2, self.conv_3]]))
+            reg += 1.0 * self.spatial_reg_coef * w_l2
+        if self._train_mask:
+            rw_l2 = torch.sum(torch.abs(self.roi_weights[self._train_set]))
+            rw_l2 = rw_l2 / self.total_features
+            reg += 1.0 * self.lin_reg_coef * rw_l2
+        spatial_logits = self.shared_cov_step(stim)
+        spatial_logits = spatial_logits.view((-1, self.n_classes) + self.in_spatial)
+        logits = self.global_step(spatial_logits, top30=top30)
+        return logits, reg
+
+    def fit(self, dataloader):
+        scale = math.prod(self.in_spatial) / math.log(math.prod(self.in_spatial))
+        # loss_fxn = torch.nn.MultiMarginLoss(p=2, margin=scale / 2)
+        loss_fxn = torch.nn.MultiMarginLoss(p=1, margin=2)
+        lr = .01
+        loss_history = []
+        if self._train_model and self._train_mask:
+            # set optim to use
+            params = (list(self.conv_1.parameters()) +
+                      list(self.conv_2.parameters()) +
+                      list(self.conv_3.parameters()) +
+                      [self.roi_weights[self._train_set]] +
+                      [self.temperatures[self._train_set]])
+            g_params =  [self.global_weights[self._train_set]]
+        elif self._train_mask:
+            lr = .02
+            params = [self.roi_weights[self._train_set]] + [self.temperatures[self._train_set]]
+            g_params = [self.global_weights[self._train_set]]
+        elif self._train_model:
+            # if only training model use CE loss
+            params = (list(self.conv_1.parameters()) +
+                      list(self.conv_2.parameters()) +
+                      list(self.conv_3.parameters()))
+        else:
+            raise ValueError("No train mode is set. Optimization would be pointless.")
+        optim = torch.optim.Adam(params=params, lr=lr)
+        for i, (stim, target) in enumerate(dataloader):
+            optim.zero_grad()
+            stim = torch.from_numpy(stim).float().to(self.device)
+            # track avg img
+            # convert targets to tensors
+            target = torch.from_numpy(target)
+            batch_size = len(target)
+            target = target.long().to(self.device)
+            glogits, reg = self.forward(stim)
+            probs = glogits / torch.linalg.norm(glogits, dim=1).unsqueeze(1)
+            loss = loss_fxn(probs, target)
+            acc = compute_acc(target, glogits, top=1)
+            loss = loss + reg  # (1)
+            loss_history.append(loss.detach().cpu().item())
+            print("Loss Epoch", i, ":", loss_history[-1], "ACC:", acc)
+            optim = util.is_converged(loss_history, optim, batch_size, i)
+            # apply gradients
+            loss.backward()
+            optim.step()
+            # compute loss independently for each logit set
+
+    def predict(self, dataloader, top30=False):
+        # set train mask and model to false
+        _recall = (self._train_model, self._train_mask)
+        self.eval(self._train_set)
+        roi_accs = {roi: 0. for roi in self.roi_names}
+        roi_accs["global"] = 0.
+        count = 1
+        for i, (stim, target) in enumerate(dataloader):
+            # convert targets to tensors
+            stim = torch.from_numpy(stim).float().to(self.device)
+            target = torch.from_numpy(target)
+            target = target.long().to(self.device)
+            with torch.no_grad():
+                gy_hat, reg = self.forward(stim, top30=top30)
+                roi_logits = self.roi_step(self.shared_cov_step(stim), top30=top30)
+            for k in roi_logits.keys():
+                racc = compute_acc(target, roi_logits[k], top=1)
+                roi_accs[k] += racc
+            acc = compute_acc(target, gy_hat, top=1)
+            roi_accs["global"] += acc
+            print("Epoch", i, "ACC:", acc)
+            count += 1
+        self.train_model, self._train_mask = _recall
+        roi_accs = {k:roi_accs[k] / count for k in roi_accs.keys()}
+        return roi_accs
+
+    def get_saliancy(self, inset, baseline=None):
+        if inset not in self.set_names:
+            raise ValueError
+        weights = self.gaussian_smoothing(self.roi_weights[inset].view((1, 1,) + self.in_spatial)).squeeze()
+        #weights = torch.relu(weights)
+        return weights.detach().cpu().numpy()
+
+
+if __name__=="__main__":
+    class TestData:
+        def __init__(self, ma, mb):
+            self.batch_size = 30
+            self.A_mean = ma
+            self.B_mean = mb
+
+        def iterator(self, epochs):
+            for i in range(epochs):
+                A_data = np.random.normal(loc=self.A_mean, scale=1, size=(self.batch_size, 2, 10, 10))
+                B_data = np.random.normal(loc=self.B_mean, scale=1, size=(self.batch_size, 2, 10, 10))
+                targets = np.concatenate([np.zeros((self.batch_size,)), np.ones((self.batch_size))])
+                data = np.concatenate([A_data, B_data])
+                shuffle = np.random.choice(np.arange(self.batch_size * 2), (self.batch_size * 2))
+                yield data[shuffle], targets[shuffle]
+
+    A = TestData(-.2, .2)
+    B = TestData(-.1, .4)
+
+    atlas = np.zeros((10, 10))
+    atlas[:, :5] = 1
+    atlas[:, 5:] = 2
+    lookup = {1: "roi_1", 2:"roi_2"}
+    decoder = ROISearchlightDecoder(atlas, lookup, set_names=("A", "B"), in_channels=2, n_classes=2, spatial=(10, 10),
+                                    nonlinear=True, device="cpu")
+    decoder.fit(A.iterator(500))
+    print("done")
+    decoder.eval("A")
+    print(decoder.predict(A.iterator(100)))
+    decoder.train_predictors("B")
+    decoder.fit(B.iterator(1000))
+    print(decoder.predict(B.iterator(100)))
+
+    sal = decoder.get_saliancy("B")
+    from matplotlib import pyplot as plt
+    plt.imshow(sal)
+    plt.show()
