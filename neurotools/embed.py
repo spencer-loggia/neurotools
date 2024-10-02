@@ -139,6 +139,7 @@ class SupervisedEmbed:
     def feature_ln(self, comp, degree):
         return torch.sum(torch.pow(torch.abs(comp), degree), dim=0).mean()
 
+
     def fit(self, X, y, max_iter=10000, verbose=False, converge_var=.01, degree=2., dist_mask=None, bootstrap_iter=100):
         """
         :param converge_var:

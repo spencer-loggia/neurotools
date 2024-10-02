@@ -303,7 +303,14 @@ def unfold_nd(input_tensor: torch.Tensor, kernel_size: Union[int, tuple[int]],
               padding: Union[int, tuple[int]], spatial_dims: int, stride=1):
     """ explicitly represents a kernel passed over a space of arbitrary dimensionality. Fixes torch unfold not working
     with more than 2 dims. Useful for arbitrary multidimensional convolutional operations"""
-    pad = list(itertools.chain(*[[padding[i]] * 2 for i in range(spatial_dims)]))  # abstract pad to both sides of input
+    if type(padding) is int:
+        pad = tuple([padding]*2*spatial_dims)
+    elif len(padding) == spatial_dims * 2:
+        pad = padding
+    elif len(padding) == spatial_dims:
+        pad = list(itertools.chain(*[[padding[i]] * 2 for i in range(spatial_dims)]))  # abstract pad to both sides of input
+    else:
+        raise ValueError
     # Assumes torch batch and channel placement (e.g. <b, c, ...>)
     batch_size = input_tensor.shape[0]
     channel_size = input_tensor.shape[1]
