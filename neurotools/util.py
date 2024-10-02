@@ -429,7 +429,7 @@ def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=0):
 def triu_to_square(triu_vector, n, includes_diag=False):
     """
     Converts an upper triangle vector to a full (redundant) symmetrical square matrix.
-    :param tri_vector: data point vector
+    :param tri_vector: data point vector. Either <batch, c, ...> or <c,>
     :param n: size of resulting square
     :param includes_diag: whether the main diagonal is included in triu_vector
     :return: a symmetric square tensor
@@ -438,10 +438,13 @@ def triu_to_square(triu_vector, n, includes_diag=False):
         offset = 0
     else:
         offset = 1
-    adj = torch.zeros((n, n), dtype=triu_vector.dtype, device=triu_vector.device)
+    if triu_vector.ndim == 1:
+        triu_vector = triu_vector.unsqueeze(0)
+    adj = torch.zeros((triu_vector.shape[0], n, n) + triu_vector.shape[2:], dtype=triu_vector.dtype, device=triu_vector.device)
     ind = torch.triu_indices(n, n, offset=offset)
-    adj[ind[0], ind[1]] = triu_vector
-    adj = (adj.T + adj)
+    adj[:, ind[0], ind[1], ...] = triu_vector
+    adj = (adj.transpose(1, 2) + adj)
     if includes_diag:
         adj = adj - torch.diag(torch.diagonal(adj) / 2)
     return adj
+
