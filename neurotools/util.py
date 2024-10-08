@@ -426,12 +426,13 @@ def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=0):
     return class_data_list, unique_filtered
 
 
-def triu_to_square(triu_vector, n, includes_diag=False):
+def triu_to_square(triu_vector, n, includes_diag=False, negate=False):
     """
     Converts an upper triangle vector to a full (redundant) symmetrical square matrix.
     :param tri_vector: data point vector. Either <batch, c, ...> or <c,>
     :param n: size of resulting square
     :param includes_diag: whether the main diagonal is included in triu_vector
+    :param negate: whether to negate the lower traingle.
     :return: a symmetric square tensor
     """
     if includes_diag:
@@ -443,8 +444,49 @@ def triu_to_square(triu_vector, n, includes_diag=False):
     adj = torch.zeros((triu_vector.shape[0], n, n) + triu_vector.shape[2:], dtype=triu_vector.dtype, device=triu_vector.device)
     ind = torch.triu_indices(n, n, offset=offset)
     adj[:, ind[0], ind[1], ...] = triu_vector
-    adj = (adj.transpose(1, 2) + adj)
-    if includes_diag:
-        adj = adj - torch.diag(torch.diagonal(adj) / 2)
-    return adj
+    if negate:
+        out_adj = (-1 * adj.transpose(1, 2) + adj) + 1e-8
+        if includes_diag:
+            out_adj = out_adj + torch.diag(torch.diagonal(adj))
+    else:
+        out_adj = (adj.transpose(1, 2) + adj)
+        if includes_diag:
+            out_adj = out_adj - torch.diag(torch.diagonal(adj))
+    return out_adj
 
+
+def confusion_from_pairwise(scores, gt, nclasses, pairwise_weights=None):
+    """
+    creates a confusion matrix from scores for each class.
+    scores must be a matrix where the upper and lower triangle are exact inverses of each other.
+    Args:
+        scores: <n, c, c, ...> square matrices of scores
+        gt: <n,> ground truth label
+        nclasses: int equal c.
+    Returns: <c, c, ...> confusion matrix / matrices, float total accuracy.
+    """
+    # # Check input
+    # if torch.sum(torch.diagonal(scores, dim1=1, dim2=2)) != 0:
+    #     raise ValueError
+    if pairwise_weights is None:
+        pairwise_weights = torch.ones((nclasses, nclasses, nclasses))
+    X = scores.detach().cpu()
+    spatial = X.shape[3:]
+    y = gt.detach().cpu()
+    classes = torch.unique(y)
+    cm = torch.zeros((nclasses, nclasses,) + tuple(spatial), dtype=torch.float)
+    for c in classes:
+        to_consider = pairwise_weights[c, c].detach().cpu()
+        num_considered = torch.count_nonzero(to_consider)
+        d = X[y == c]
+        scores = d[:, c]
+        scores = scores * to_consider.unsqueeze(0) # zeros not considered scored
+        cm[c, c] += torch.count_nonzero(scores > 0)
+        pred_tally = torch.count_nonzero(scores < 0, dim=0)
+        for pred_c in range(nclasses):
+            if to_consider[pred_c] == 0:
+                continue
+            cm[c, pred_c] += pred_tally[pred_c]
+    full_acc = torch.sum(torch.diagonal(cm)) / torch.sum(cm)
+    cm[torch.arange(nclasses), torch.arange(nclasses)] /= num_considered # scale for viewing
+    return cm.squeeze().detach().numpy(), full_acc.detach().item()

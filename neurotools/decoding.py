@@ -3,6 +3,7 @@ import datetime
 import itertools
 import math
 import os
+import random
 from typing import Tuple, Union, List
 
 import numpy as np
@@ -20,7 +21,7 @@ except Exception:
     print("Captum module not found, deeplift attribution method not available")
 
 
-def compute_acc(y, yhat, top=3):
+def compute_acc(y, yhat, top=1):
     """
     :param y: 1d of target class labels
     :param yhat: 2d of class scores
@@ -302,7 +303,7 @@ class GlobalMultiStepCrossDecoder:
         if reset_mask:
             self._reset_mask()
         for i in range(self.n_sets):
-            X.resample = False
+            X.resample = True
             if self.unify_fit:
                 mask_iters = (iters // 2) + 1
                 # if train mask was updated during fit, we initialize the cross set mask to it.
@@ -326,7 +327,7 @@ class GlobalMultiStepCrossDecoder:
         for i in range(self.n_sets):
             accs.append([])
             X.epochs = iters
-            X.resample = False
+            X.resample = True
             with torch.no_grad():
                 local_loss, local_acc = self._fit(X, i, iters=iters, update=False)
             for j in range(self.n_sets):
@@ -748,6 +749,82 @@ class VarConvND(torch.nn.Module):
         h = h.view([batch_size, self.out_channels] + self.in_spatial)
         return h
 
+class PairwiseLoss(torch.nn.Module):
+    """
+    Gets upper triangle of pairwise log odds for each class
+    Evaluates probability at c out of c(c-1)/2 scores for each class.
+    Transforms multiclass into a pairwise binary classification problem,
+    But allows use of shared network resource. i.e. classes only need
+    separate on last layer.
+    """
+    def __init__(self, nclasses, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nclasses = nclasses
+        self.exp_scores = int(nclasses*(nclasses - 1) / 2)
+
+    def forward(self, X, y, pairwise_weights=None):
+        """
+        Args:
+            X: <n, c, ...>
+            y: <n,>
+
+        Returns:
+        """
+        classes = torch.unique(y)
+        tailing_dim = X.ndim - 3
+        loss = torch.tensor([0.], device=X.device)
+        for c in classes:
+            d = X[y==c]
+            # ask each relevant regressor, is c? early index class is always consider "TRUE"
+            scores = torch.tanh(d[:, c])
+            full_loss = -1 * scores # self.loss_model(scores, torch.ones_like(scores, device=X.device))
+            if pairwise_weights is not None:
+                class_weights = pairwise_weights[c, c].reshape((1, pairwise_weights.shape[1]) + tuple([1]*tailing_dim))
+                # weight pairwise losses
+                loss += torch.sum(full_loss * class_weights)
+            else:
+                loss += torch.sum(full_loss)
+        return loss
+
+
+class Identity(torch.nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def forward(self, x):
+        return x
+
+
+class CircularSelector(torch.nn.Module):
+
+    def __init__(self, nclasses, device="cpu", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        x = 2 * torch.pi * torch.arange(nclasses, device=device) / nclasses
+        x_class_locs = torch.cos(x)
+        y_class_locs = torch.sin(x)
+        self.nclasses = nclasses
+        self.class_locs = torch.stack([x_class_locs, y_class_locs], dim=1) # c, 2
+        self.radius = 1
+
+    def forward(self, positions):
+        """
+        Parameters
+        ----------
+        positions <n, 2, ...>
+
+        Returns Tensor <n, c, ...> distances to each class center
+        -------
+        """
+        batch_size = positions.shape[0]
+        spatial_dims = positions.shape[2:]
+        p = positions.view((batch_size, 2, -1)).transpose(1, 2) # b, s, m
+        p = p / (1e-8 + torch.linalg.norm(p, dim=2).unsqueeze(2)) # select on the unit circle
+        loc = torch.tile(self.class_locs, (batch_size, 1, 1)) # b, c, m 
+        dists = torch.cdist(p, loc, p=2) # b, s, c
+        scores = self.radius - dists
+        scores = scores.transpose(1, 2)
+        scores = scores.reshape((batch_size, self.nclasses) + spatial_dims)
+        return scores
+
 
 class ROISearchlightDecoder():
     """
@@ -755,7 +832,7 @@ class ROISearchlightDecoder():
     """
     def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str],
                  nonlinear=True, spatial=(64, 64, 64), in_channels=2, n_classes=2, device="cuda",
-                 share_conv=False):
+                 share_conv=False, pairwise=False, pairwise_weights=None):
         self.atlas = atlas
         self.lookup = lookup
         self.roi_names = list(self.lookup.values())
@@ -771,7 +848,12 @@ class ROISearchlightDecoder():
         self._train_mask = True
         self.share_conv = share_conv
         self.device = device
-        base_chan = math.ceil(.5 * np.log(self.n_classes)) * 2**self.dim
+        self.pairwise = pairwise
+        if pairwise_weights is None:
+            self.pairwise_weights = torch.ones((n_classes, n_classes, n_classes), device=self.device)
+        else:
+            self.pairwise_weights = pairwise_weights  # mask to use for each input class. Some classes should only be compared to some others.
+        base_chan = int(math.floor(math.log(n_classes))) + 1
         if self.dim == 2:
             ConvConstr = torch.nn.Conv2d
             forward_padding = (0, 1, 0, 1)
@@ -782,29 +864,29 @@ class ROISearchlightDecoder():
             forward_padding = (0, 1, 0, 1, 0, 1)
             reverse_padding = (1, 0, 1, 0, 1, 0)
             BnConstr = torch.nn.BatchNorm3d
-
-        self.conv_1 = VarConvND(in_channels=in_channels, out_channels=2 ** self.dim // 2, kernel_size=2,
+        self.out_feat = n_classes
+        self.conv_1 = VarConvND(in_channels=in_channels, out_channels=2, kernel_size=2,
                                 padding=reverse_padding,
                                 spatial=self.in_spatial, ndims=self.dim, bias=False,
                                 dtype=torch.float, device=self.device)
-        self.conv_2 = VarConvND(in_channels=2 ** self.dim // 2, out_channels=2 ** self.dim, kernel_size=2, padding=forward_padding,
+        self.conv_2 = VarConvND(in_channels=2, out_channels=2, kernel_size=2, padding=forward_padding,
                                  dtype=torch.float, device=self.device, bias=False, ndims=self.dim,
                                 spatial=self.in_spatial,) # defualts to same as forward padding
-        self.conv_3 = VarConvND(in_channels=2 ** self.dim, out_channels=n_classes, kernel_size=2,
+        self.conv_3 = VarConvND(in_channels=2, out_channels=2, kernel_size=2,
                                 padding=reverse_padding,
                                 spatial=self.in_spatial, ndims=self.dim, bias=False,
                                 dtype=torch.float, device=self.device)
-
-        self.search_dropout = torch.nn.Dropout(p=0.3)
-        self.predictor_dropout = torch.nn.Dropout(p=0.3)
+        self.conv_4 = CircularSelector(nclasses=self.n_classes, device=device)
+        self.search_dropout = torch.nn.Dropout(p=0.0)
+        self.predictor_dropout = torch.nn.Dropout(p=0.0)
         self.activation = torch.nn.LeakyReLU()
         self._smooth_kernel_size = 5
         self.smooth_kernel = self._create_smoothing_kernel(self._smooth_kernel_size)
         # initialize weights from searchlights to rois
         self.roi_weights = {}
         self.total_features = 0
-        self.lin_reg_coef = 1e-5
-        self.spatial_reg_coef = 0.00
+        self.lin_reg_coef = 1e-4
+        self.spatial_reg_coef = 1e-5
         self.mask = np.zeros(self.in_spatial)
         for roi_ind in self.lookup.keys():
             roi = self.atlas==roi_ind
@@ -814,13 +896,27 @@ class ROISearchlightDecoder():
         self.mask = torch.from_numpy(self.mask).to(device).float()
         self.global_weights = {}
         self.temperature  = torch.nn.Parameter(torch.tensor([.1], device=self.device))
+        self.test_bias = {}
         for s in self.set_names:
-            weight = torch.empty(self.in_spatial, device=device)
+            weight = torch.empty(self.in_spatial, device=device, dtype=torch.float)
             weight = torch.nn.Parameter(torch.abs(torch.nn.init.zeros_(weight)) + .01)
             self.roi_weights[s] = weight
-            weight = torch.empty((len(self.roi_weights),), device=self.device)
+            weight = torch.empty((len(self.roi_weights),), device=self.device, dtype=torch.float16)
             weight = torch.nn.Parameter(torch.nn.init.ones_(weight))
             self.global_weights[s] = weight
+            if pairwise:
+                # if s == self.set_names[0]:
+                #     self.test_bias[s] = torch.nn.Parameter(torch.zeros((1, int(n_classes * (n_classes - 1) / 2),) + self.in_spatial, device=device, dtype=torch.float))
+                bias = torch.empty((1, int(n_classes * (n_classes - 1) / 2),) + self.in_spatial, device=device,dtype=torch.float)
+                self.test_bias[s] = torch.nn.Parameter(torch.nn.init.zeros_(bias))
+            else:
+                self.test_bias[s] = torch.nn.Parameter(torch.zeros(n_classes, device=device, dtype=torch.float))
+
+    def reset_weights(self, set):
+        weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
+        weight = torch.nn.Parameter(torch.abs(torch.nn.init.zeros_(weight)) + .01)
+        self.roi_weights[set] = weight
+        self.test_bias[set] = torch.nn.Parameter(torch.zeros((1, int(self.n_classes * (self.n_classes - 1) / 2),) + self.in_spatial, device=self.device, dtype=torch.float))
 
     def train_searchlight(self, set, on=True):
         if set not in self.set_names:
@@ -852,7 +948,7 @@ class ROISearchlightDecoder():
 
     def _create_smoothing_kernel(self, kernel_size):
         # Create the Gaussian kernel
-        sigma = 0.5
+        sigma = .75
         if self.dim == 2:
             kernel = np.zeros((kernel_size, kernel_size))
             kernel[kernel_size // 2, kernel_size // 2] = 1
@@ -867,19 +963,32 @@ class ROISearchlightDecoder():
         kernel_tensor = torch.from_numpy(kernel).float().unsqueeze(0).unsqueeze(0).to(self.device)
         return kernel_tensor
 
-    def gaussian_smoothing(self, tensor, *args):
-        tensor = torch.square(tensor)
+    def gaussian_smoothing(self, tensor, unit_range=True, *args):
         stride = 1  # self.smooth_kernel_size // 2
+        oshape = tensor.shape
+        sk = self.smooth_kernel.tile((1, 1) + tuple([1] * self.dim))
+        if unit_range:
+            tensor = torch.square(tensor)
+        tensor = tensor.view((tensor.shape[0] * tensor.shape[1], 1) + tensor.shape[2:]) # channels to batch
         if self.dim == 3:
-            smoothed_tensor = conv3d(tensor, self.smooth_kernel, stride=stride, padding=self._smooth_kernel_size // 2)
+            smoothed_tensor = conv3d(tensor, sk, stride=stride, padding=self._smooth_kernel_size // 2)
         elif self.dim == 2:
-            smoothed_tensor = conv2d(tensor, self.smooth_kernel, stride=stride, padding=self._smooth_kernel_size // 2)
+            smoothed_tensor = conv2d(tensor, sk, stride=stride, padding=self._smooth_kernel_size // 2)
         else:
             raise RuntimeError("Working dimensionality must be either 2 or 3")
         if smoothed_tensor.shape[-self.dim:] != self.in_spatial:
             upsampler = torch.nn.Upsample(size=self.in_spatial, mode="nearest")
             smoothed_tensor = upsampler(smoothed_tensor)
+        smoothed_tensor = smoothed_tensor.view(oshape) # batch to channels
         return smoothed_tensor
+
+    def linear_weight_logits(self, in_logits, weights, bias):
+        bias = util.triu_to_square(bias, n=self.n_classes, negate=True)
+        in_logits = in_logits.unsqueeze(2)  # add new channel for square
+        in_logits = in_logits - in_logits.transpose(1, 2)  # compute pairwise diff.
+        in_logits = in_logits + bias
+        in_logits = in_logits * weights.unsqueeze(2)   
+        return in_logits
 
     def roi_step(self, spatial_logits, top30=False):
         """
@@ -889,23 +998,17 @@ class ROISearchlightDecoder():
 
         Returns: dict roi logits
         """
-        spatial_logits, labels = util.atlas_to_list(spatial_logits, self.atlas) # [<batch, cl, roi>, ..., <>]
-        spatial_weights = self.gaussian_smoothing(self.roi_weights[self._train_set].view((1, 1,) + self.in_spatial))
-        spatial_weights, w_labels = util.atlas_to_list(spatial_weights, self.atlas)
         roi_logits = {}
         for i, l in enumerate(self.lookup.keys()):
-            rlogits = spatial_logits[labels.index(l)]  # <batch, cl, roi>
-            rlogits = rlogits
-            rstim = torch.softmax(rlogits, dim=1) - (1 / self.n_classes) #  / torch.linalg.norm(rlogits, dim=1).unsqueeze(1)
-            rw = spatial_weights[w_labels.index(l)]
-            # get max perclass
+            ryhat = spatial_logits[..., (self.atlas==l).flatten()]  # <batch, cl, roi>
             n = self.lookup[l]
-            # rstim = torch.softmax(rlogits, dim=1)  # convert to probs, so we give equal initial weight to each loc
-            ryhat = rstim * rw.view((1, 1, -1))  # batch, cl, roi
             if top30:
                 sinds = torch.argsort(torch.max(ryhat, dim=1)[0].mean(dim=0))
-                ryhat = ryhat[:, :, sinds[-30:]]
-            roi_logits[n] = ryhat.sum(dim=2)
+                ryhat = ryhat[:, :, : sinds[-30:]]
+            if self.pairwise:
+                roi_logits[n] = ryhat.sum(dim=3)  # batch, cl  * (self.global_weights[self._train_set]).view((1, 1, -1))
+            else:
+                roi_logits[n] = ryhat.sum(dim=3)
         return roi_logits
 
     def global_step(self, spatial_logits, top30=False):
@@ -914,25 +1017,39 @@ class ROISearchlightDecoder():
             stim: <batch, c_in, s1, s2, s3>
         Returns: dist roi logits, global logits
         """
+        if self.pairwise:
+            chance = .5
+            p_func = torch.nn.Sigmoid()
+        else:
+            p_func = torch.nn.Softmax(dim=1)
+            chance = 1 / self.n_classes
         batch_size = spatial_logits.shape[0]
+        # spatial_logits = torch.softmax(spatial_logits, dim=1)
+        # if self._train_mask:
+        bias = self.gaussian_smoothing(self.test_bias[self._train_set], unit_range=False)
+        bias = util.triu_to_square(bias, n=self.n_classes, negate=True)
+        spatial_logits = spatial_logits.unsqueeze(2)  # add new channel for square
+        spatial_logits = spatial_logits - spatial_logits.transpose(1, 2)  # compute pairwise diff.
+        spatial_logits = spatial_logits + bias
+        # generate smmothed weights
+        # if not (self._train_model and not self._train_mask):
         weights = self.roi_weights[self._train_set]
         weights = self.gaussian_smoothing(weights.view((1, 1,) + self.in_spatial))
-        # spatial_logits = torch.softmax(spatial_logits, dim=1)
-        if self._train_mask:
-            spatial_logits = spatial_logits + torch.normal(0., .05, size=spatial_logits.shape, device=self.device)
-        spatial_logits = torch.softmax(spatial_logits, dim=1) - (1 / self.n_classes)
-        # spatial_logits = spatial_logits / torch.linalg.norm(spatial_logits, dim=1).unsqueeze(1)
-        spatial_logits = spatial_logits * weights
-        spatial_logits = spatial_logits.view((batch_size, self.n_classes, -1))
+        weights = self.predictor_dropout(weights)
+        mod = 1e-8 # * (2 * torch.randint_like(spatial_logits, low=0, high=2) - 1)
+        spatial_logits = (spatial_logits) / (torch.abs(spatial_logits) + mod).detach()
+        spatial_logits = spatial_logits * weights.unsqueeze(2)
+        spatial_logits = spatial_logits.view((batch_size, self.out_feat, self.out_feat, -1))
+        diag_mask = torch.logical_not(torch.eye(self.n_classes, device=self.device)).view(1, self.n_classes, self.n_classes, 1)
+        spatial_logits = spatial_logits * diag_mask
         if top30:
             sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
-            spatial_logits = spatial_logits[:, :, sinds[-30:]]
-        gyhat = spatial_logits.sum(dim=2) # batch, cl  * (self.global_weights[self._train_set]).view((1, 1, -1))
-        return gyhat
+            spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
+        return spatial_logits
 
     def renormalize_batch(self, X):
         m = X.mean(dim=(0, 1)).view((1, 1,) + self.in_spatial)
-        s = X.std(dim=(0, 1)).view((1, 1,) + self.in_spatial) + 1e-8
+        s = X.std(dim=(0, 1)).view((1, 1,) + self.in_spatial) + 1e-6
         X = (X - m) / s
         return X
 
@@ -940,12 +1057,10 @@ class ROISearchlightDecoder():
         if not self.share_conv:
             raise ValueError("Not set in share conv mode. Run `step` instead.")
         h = self.conv_1(stim)
-        h = self.renormalize_batch(h)
         h = self.activation(h)
         if self._train_model or self._train_mask:
             h = self.search_dropout(h)
         h = self.conv_2(h)
-        h = self.renormalize_batch(h)
         #h = self.bn2[self._train_set](h)
         h = self.activation(h)
         h = self.conv_3(h)
@@ -953,7 +1068,7 @@ class ROISearchlightDecoder():
         # h = self.activation(h)
         # if self._train_model or self._train_mask:
         #     h = self.search_dropout(h)
-        # h = self.conv_4(h)
+        h = self.conv_4(h)
         # h = self.renormalize_batch(h)
         # #h = self.bn4[self._train_set](h)
         # h = self.conv_5(h)
@@ -967,36 +1082,44 @@ class ROISearchlightDecoder():
                                           for w in [self.conv_1, self.conv_2, self.conv_3]]))
             reg += 1.0 * self.spatial_reg_coef * w_l2
         if self._train_mask:
-            rw_l2 = torch.mean(torch.abs(self.roi_weights[self._train_set]))
-            rw_l2 = rw_l2 / self.total_features
+            rw_l2 = torch.mean(torch.square(self.roi_weights[self._train_set]))
             reg += 1.0 * self.lin_reg_coef * rw_l2
         spatial_logits = self.shared_cov_step(stim)
-        spatial_logits = spatial_logits.view((-1, self.n_classes) + self.in_spatial)
-        logits = self.global_step(spatial_logits, top30=top30)
+        spatial_logits = spatial_logits.view((-1, self.out_feat) + self.in_spatial)
+        logits = self.global_step(spatial_logits, top30=top30) # <n, c, c, x, y, z>
         return logits, reg
 
     def fit(self, dataloader):
         # loss_fxn = torch.nn.MultiMarginLoss(p=2, margin=scale / 2)
-        loss_fxn = torch.nn.MultiMarginLoss(p=2, margin=math.prod(self.in_spatial) * (1 / self.n_classes), reduction="sum")
+        if self.pairwise:
+            loss_fxn = PairwiseLoss(nclasses=self.n_classes)
+        else:
+            loss_fxn = torch.nn.MultiMarginLoss(p=2, margin=math.prod(self.in_spatial) * (1 / self.n_classes), reduction="sum")
         lr = .01
         loss_history = []
+        # if self._train_set == self.set_names[0]:
+        #     # no bias for first set
+        #     bias_param = []
+        # else:
+        bias_param = [self.test_bias[self._train_set]]
         if self._train_model and self._train_mask:
             # set optim to use
             params = (list(self.conv_1.parameters()) +
                       list(self.conv_2.parameters()) +
                       list(self.conv_3.parameters()) +
                       [self.roi_weights[self._train_set]] +
-                      [self.temperature])
+                      bias_param)
             g_params =  [self.global_weights[self._train_set]]
         elif self._train_mask:
-            lr = .02
-            params = [self.roi_weights[self._train_set]]
+            lr = .01
+            params = [self.roi_weights[self._train_set]] + bias_param
             g_params = [self.global_weights[self._train_set]]
         elif self._train_model:
             # if only training model use CE loss
             params = (list(self.conv_1.parameters()) +
                       list(self.conv_2.parameters()) +
-                      list(self.conv_3.parameters()) + [self.temperature])
+                      list(self.conv_3.parameters()) +
+                      [self.temperature])
         else:
             raise ValueError("No train mode is set. Optimization would be pointless.")
         optim = torch.optim.Adam(params=params, lr=lr)
@@ -1011,8 +1134,30 @@ class ROISearchlightDecoder():
             glogits, reg = self.forward(stim)
             # probs = glogits / torch.linalg.norm(glogits, dim=1).unsqueeze(1)
             probs = glogits # * self.temperature
-            loss = loss_fxn(probs, target)
-            acc = compute_acc(target, glogits, top=3)
+            if self.pairwise:
+                if self._train_model and not self._train_mask:
+                    # if we're training the model and not the mask we compute loss at each spot before summing.
+                    loss = loss_fxn(probs, target, pairwise_weights=self.pairwise_weights)
+                    probs = probs.mean(dim=3)
+                else:
+                    # if we're training the mask or evaluating we combined logits before loss.
+                    probs = probs.mean(dim=3)
+                    loss = loss_fxn(probs, target, pairwise_weights=self.pairwise_weights)
+                     # batch, cl  * (self.global_weights[self._train_set]).view((1, 1, -1))
+            else:
+                tail_dims = probs.ndim - 2
+                test_bias = self.test_bias[self._train_set].reshape((1, self.n_classes) + tuple([1]*tail_dims))
+                probs = probs + test_bias
+                for c in range(self.n_classes):
+                    probs[target==c] = probs[target==c] * self.pairwise_weights[c, c].reshape((1, self.n_classes) + tuple([1]*tail_dims))
+                if self._train_model and not self._train_mask:
+                    loss = loss_fxn(probs, target)
+                    probs = probs.sum(dim=2)
+                else:
+                    probs = probs.sum(dim=2)
+                    loss = loss_fxn(probs, target)
+            # acc = compute_acc(target, glogits, pairwise=True, top=1)
+            _, acc = util.confusion_from_pairwise(probs, target, self.n_classes, pairwise_weights=self.pairwise_weights)
             loss = loss + reg  # (1)
             loss_history.append(loss.detach().cpu().item())
             print("Loss Epoch", i, ":", loss_history[-1], "ACC:", acc)
@@ -1027,7 +1172,9 @@ class ROISearchlightDecoder():
         _recall = (self._train_model, self._train_mask)
         self.eval(self._train_set)
         roi_accs = {roi: 0. for roi in self.roi_names}
+        roi_cm = {roi: np.zeros((self.n_classes, self.n_classes)) for roi in self.roi_names}
         roi_accs["global"] = 0.
+        roi_cm["global"] = np.zeros((self.n_classes, self.n_classes))
         count = 1
         for i, (stim, target) in enumerate(dataloader):
             # convert targets to tensors
@@ -1035,24 +1182,41 @@ class ROISearchlightDecoder():
             target = torch.from_numpy(target)
             target = target.long().to(self.device)
             with torch.no_grad():
-                gy_hat, reg = self.forward(stim, top30=top30)
-                roi_logits = self.roi_step(self.shared_cov_step(stim), top30=top30)
+                gy_hat, reg = self.forward(stim, top30=False)
+                roi_logits = self.roi_step(gy_hat, top30=top30)
+                gy_hat = gy_hat.sum(dim=3)
             for k in roi_logits.keys():
-                racc = compute_acc(target, roi_logits[k], top=3)
+                if not self.pairwise:
+                    roi_logits[k] = roi_logits[k]
+                    for c in range(self.n_classes):
+                        roi_logits[k][target == c] = roi_logits[k][target == c] * self.pairwise_weights[c, c].unsqueeze(0)
+                rcm, racc = util.confusion_from_pairwise(roi_logits[k], target, self.n_classes, pairwise_weights=self.pairwise_weights)
                 roi_accs[k] += racc
-            acc = compute_acc(target, gy_hat, top=3)
+                roi_cm[k] += rcm.squeeze()
+            cm, acc = util.confusion_from_pairwise(gy_hat, target, self.n_classes, pairwise_weights=self.pairwise_weights)
+            # acc = compute_acc(target, gy_hat, pairwise=True, top=1)
             roi_accs["global"] += acc
+            roi_cm["global"] += cm
             print("Epoch", i, "ACC:", acc)
             count += 1
         self.train_model, self._train_mask = _recall
         roi_accs = {k:roi_accs[k] / count for k in roi_accs.keys()}
-        return roi_accs
+        roi_cm = {k:roi_cm[k] / np.sum(roi_cm[k], axis=1)[None, :] for k in roi_accs.keys()} # normalize confusion matrices
+        return roi_accs, roi_cm
 
     def get_saliancy(self, inset, baseline=None):
         if inset not in self.set_names:
             raise ValueError
-        weights = self.gaussian_smoothing(self.roi_weights[inset].view((1, 1,) + self.in_spatial)).squeeze()
+        w = self.roi_weights[inset].view((1, 1,) + self.in_spatial)
+        weights = self.gaussian_smoothing(w).squeeze()
         return weights.detach().cpu().numpy()
+
+    def get_bias(self, inset, class_id):
+        if inset not in self.set_names:
+            raise ValueError
+        b = self.gaussian_smoothing(self.test_bias[inset], unit_range=False)
+        b = b[:, class_id].view((1, 1,) + self.in_spatial).squeeze()
+        return b.detach().cpu().numpy()
 
 
 if __name__=="__main__":
