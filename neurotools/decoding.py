@@ -826,13 +826,56 @@ class CircularSelector(torch.nn.Module):
         return scores
 
 
+class SpatialBN(torch.nn.Module):
+    """
+    Impliments a nonparametric varient of batch normalization over each channel and spatial dimension
+    """
+    def __init__(self, train=True, device="cpu", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.to_trian = train
+        self.last = None
+        self.std_memory = None
+        self.mean_memory = None
+        self.offset = torch.nn.Parameter(torch.tensor([0.], device=device))
+        self.scale = torch.nn.Parameter(torch.tensor([1.], device=device))
+
+    def train(self, mode=True):
+        self.to_trian = mode
+
+    def forward(self, X):
+        bs = X.shape[0]
+        spatial = X.shape[2:]
+        run_discount = bs / 100
+        mem_discount = .2 * run_discount
+        if self.to_trian:
+            if self.last is None:
+                self.last = X.detach().clone()
+            Xa = self.last * run_discount + (1 - run_discount) * X
+            self.last = Xa.detach()
+            m = Xa.mean(dim=(0, 1)).view((1, 1,) + spatial)
+            s = Xa.std(dim=(0, 1)).view((1, 1,) + spatial) + 1e-8
+            if self.std_memory is None:
+                self.std_memory = m.detach()
+                self.mean_memory = s.detach()
+            else:
+                self.std_memory = mem_discount * self.std_memory + (1 - mem_discount) * s.detach()
+                self.mean_memory = mem_discount * self.mean_memory + (1 - mem_discount) * m.detach()
+        else:
+            if self.std_memory is None:
+                raise ValueError("Must train SpatialBN first")
+            m = self.mean_memory
+            s = self.std_memory
+        X = self.offset + self.scale * (X - m) / s
+        return X
+
+
 class ROISearchlightDecoder():
     """
     Seperate masking decoder for each ROI
     """
     def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str],
                  nonlinear=True, spatial=(64, 64, 64), in_channels=2, n_classes=2, device="cuda",
-                 share_conv=False, pairwise=False, pairwise_weights=None):
+                 share_conv=False, pairwise=False, pairwise_weights=None, sessions=None):
         self.atlas = atlas
         self.lookup = lookup
         self.roi_names = list(self.lookup.values())
@@ -848,75 +891,73 @@ class ROISearchlightDecoder():
         self._train_mask = True
         self.share_conv = share_conv
         self.device = device
+        self.sessions = sessions
         self.pairwise = pairwise
         if pairwise_weights is None:
             self.pairwise_weights = torch.ones((n_classes, n_classes, n_classes), device=self.device)
         else:
             self.pairwise_weights = pairwise_weights  # mask to use for each input class. Some classes should only be compared to some others.
-        base_chan = int(math.floor(math.log(n_classes))) + 1
+        base_chan = int(math.ceil(math.log(n_classes))) + 1
         if self.dim == 2:
             ConvConstr = torch.nn.Conv2d
             forward_padding = (0, 1, 0, 1)
             reverse_padding = (1, 0, 1, 0)
-            BnConstr = torch.nn.BatchNorm2d
         else:
             ConvConstr = torch.nn.Conv3d
             forward_padding = (0, 1, 0, 1, 0, 1)
             reverse_padding = (1, 0, 1, 0, 1, 0)
-            BnConstr = torch.nn.BatchNorm3d
+        _first_out = 4
         self.out_feat = n_classes
-        self.conv_1 = VarConvND(in_channels=in_channels, out_channels=2, kernel_size=2,
+        self.conv_1 = VarConvND(in_channels=in_channels, out_channels=_first_out, kernel_size=2,
                                 padding=reverse_padding,
                                 spatial=self.in_spatial, ndims=self.dim, bias=False,
                                 dtype=torch.float, device=self.device)
-        self.conv_2 = VarConvND(in_channels=2, out_channels=2, kernel_size=2, padding=forward_padding,
+        self.conv_2 = VarConvND(in_channels=_first_out, out_channels=2*base_chan, kernel_size=2, padding=forward_padding,
                                  dtype=torch.float, device=self.device, bias=False, ndims=self.dim,
                                 spatial=self.in_spatial,) # defualts to same as forward padding
-        self.conv_3 = VarConvND(in_channels=2, out_channels=2, kernel_size=2,
+        self.conv_3 = VarConvND(in_channels=2*base_chan, out_channels=self.n_classes, kernel_size=2,
                                 padding=reverse_padding,
                                 spatial=self.in_spatial, ndims=self.dim, bias=False,
                                 dtype=torch.float, device=self.device)
-        self.conv_4 = CircularSelector(nclasses=self.n_classes, device=device)
-        self.search_dropout = torch.nn.Dropout(p=0.0)
-        self.predictor_dropout = torch.nn.Dropout(p=0.0)
-        self.activation = torch.nn.LeakyReLU()
+        self.search_dropout = torch.nn.Dropout3d(p=0.35)
+        self.predictor_dropout = torch.nn.Dropout(p=.1)
+        self.activation = torch.nn.Identity() #torch.nn.LeakyReLU(negative_slope=.1)
         self._smooth_kernel_size = 5
         self.smooth_kernel = self._create_smoothing_kernel(self._smooth_kernel_size)
+        self.session_weights = {}
+        # if sessions weights are provided, we rewieght channels after layer 2 by session.
+        if self.sessions is None:
+            self.session_weights["all"] = torch.nn.Parameter(torch.ones((2*base_chan,), device=self.device))
+        else:
+            for s in sessions:
+                self.session_weights[s] = torch.nn.Parameter(torch.ones((2*base_chan,), device=self.device))
+        self.total_features = 0
+        self.lin_reg_coef = 1e-6
+        self.spatial_reg_coef = 1e-7
+        self.mask = np.zeros(self.in_spatial)
+        self.sess_chan_map = {}
         # initialize weights from searchlights to rois
         self.roi_weights = {}
-        self.total_features = 0
-        self.lin_reg_coef = 1e-4
-        self.spatial_reg_coef = 1e-5
-        self.mask = np.zeros(self.in_spatial)
         for roi_ind in self.lookup.keys():
             roi = self.atlas==roi_ind
             roi_size = np.count_nonzero(roi)
             self.total_features += roi_size
             self.mask[roi] = 1
         self.mask = torch.from_numpy(self.mask).to(device).float()
-        self.global_weights = {}
         self.temperature  = torch.nn.Parameter(torch.tensor([.1], device=self.device))
-        self.test_bias = {}
+        self.bn = {}
+        self.stimbn = {}
         for s in self.set_names:
             weight = torch.empty(self.in_spatial, device=device, dtype=torch.float)
-            weight = torch.nn.Parameter(torch.abs(torch.nn.init.zeros_(weight)) + .01)
+            weight = torch.nn.Parameter(torch.nn.init.kaiming_normal_(weight) + .01)
             self.roi_weights[s] = weight
-            weight = torch.empty((len(self.roi_weights),), device=self.device, dtype=torch.float16)
-            weight = torch.nn.Parameter(torch.nn.init.ones_(weight))
-            self.global_weights[s] = weight
-            if pairwise:
-                # if s == self.set_names[0]:
-                #     self.test_bias[s] = torch.nn.Parameter(torch.zeros((1, int(n_classes * (n_classes - 1) / 2),) + self.in_spatial, device=device, dtype=torch.float))
-                bias = torch.empty((1, int(n_classes * (n_classes - 1) / 2),) + self.in_spatial, device=device,dtype=torch.float)
-                self.test_bias[s] = torch.nn.Parameter(torch.nn.init.zeros_(bias))
-            else:
-                self.test_bias[s] = torch.nn.Parameter(torch.zeros(n_classes, device=device, dtype=torch.float))
+            self.bn[s] = SpatialBN(device=device)
+            self.stimbn[s] = SpatialBN(device=device)
 
     def reset_weights(self, set):
         weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
-        weight = torch.nn.Parameter(torch.abs(torch.nn.init.zeros_(weight)) + .01)
+        weight = torch.nn.Parameter(torch.abs(torch.nn.init.kaiming_normal_(weight)) + .01)
         self.roi_weights[set] = weight
-        self.test_bias[set] = torch.nn.Parameter(torch.zeros((1, int(self.n_classes * (self.n_classes - 1) / 2),) + self.in_spatial, device=self.device, dtype=torch.float))
 
     def train_searchlight(self, set, on=True):
         if set not in self.set_names:
@@ -982,14 +1023,6 @@ class ROISearchlightDecoder():
         smoothed_tensor = smoothed_tensor.view(oshape) # batch to channels
         return smoothed_tensor
 
-    def linear_weight_logits(self, in_logits, weights, bias):
-        bias = util.triu_to_square(bias, n=self.n_classes, negate=True)
-        in_logits = in_logits.unsqueeze(2)  # add new channel for square
-        in_logits = in_logits - in_logits.transpose(1, 2)  # compute pairwise diff.
-        in_logits = in_logits + bias
-        in_logits = in_logits * weights.unsqueeze(2)   
-        return in_logits
-
     def roi_step(self, spatial_logits, top30=False):
         """
         Get scores for each ROI
@@ -1006,7 +1039,7 @@ class ROISearchlightDecoder():
                 sinds = torch.argsort(torch.max(ryhat, dim=1)[0].mean(dim=0))
                 ryhat = ryhat[:, :, : sinds[-30:]]
             if self.pairwise:
-                roi_logits[n] = ryhat.sum(dim=3)  # batch, cl  * (self.global_weights[self._train_set]).view((1, 1, -1))
+                roi_logits[n] = ryhat.sum(dim=3)
             else:
                 roi_logits[n] = ryhat.sum(dim=3)
         return roi_logits
@@ -1017,25 +1050,20 @@ class ROISearchlightDecoder():
             stim: <batch, c_in, s1, s2, s3>
         Returns: dist roi logits, global logits
         """
-        if self.pairwise:
-            chance = .5
-            p_func = torch.nn.Sigmoid()
-        else:
-            p_func = torch.nn.Softmax(dim=1)
-            chance = 1 / self.n_classes
         batch_size = spatial_logits.shape[0]
         # spatial_logits = torch.softmax(spatial_logits, dim=1)
         # if self._train_mask:
-        bias = self.gaussian_smoothing(self.test_bias[self._train_set], unit_range=False)
-        bias = util.triu_to_square(bias, n=self.n_classes, negate=True)
+        #bias = self.gaussian_smoothing(self.last_bias[self._train_set], unit_range=False)
+       # bias = util.triu_to_square(bias, n=self.n_classes, negate=True)
         spatial_logits = spatial_logits.unsqueeze(2)  # add new channel for square
         spatial_logits = spatial_logits - spatial_logits.transpose(1, 2)  # compute pairwise diff.
-        spatial_logits = spatial_logits + bias
+        #spatial_logits = spatial_logits + bias
         # generate smmothed weights
         # if not (self._train_model and not self._train_mask):
         weights = self.roi_weights[self._train_set]
         weights = self.gaussian_smoothing(weights.view((1, 1,) + self.in_spatial))
-        weights = self.predictor_dropout(weights)
+        if self._train_mask:
+            weights = self.predictor_dropout(weights)
         mod = 1e-8 # * (2 * torch.randint_like(spatial_logits, low=0, high=2) - 1)
         spatial_logits = (spatial_logits) / (torch.abs(spatial_logits) + mod).detach()
         spatial_logits = spatial_logits * weights.unsqueeze(2)
@@ -1047,83 +1075,92 @@ class ROISearchlightDecoder():
             spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
         return spatial_logits
 
-    def renormalize_batch(self, X):
-        m = X.mean(dim=(0, 1)).view((1, 1,) + self.in_spatial)
-        s = X.std(dim=(0, 1)).view((1, 1,) + self.in_spatial) + 1e-6
-        X = (X - m) / s
-        return X
-
-    def shared_cov_step(self, stim):
+    def shared_cov_step(self, stim, sess=None):
         if not self.share_conv:
             raise ValueError("Not set in share conv mode. Run `step` instead.")
+        stim = self.stimbn[self._train_set](stim)
         h = self.conv_1(stim)
         h = self.activation(h)
         if self._train_model or self._train_mask:
             h = self.search_dropout(h)
         h = self.conv_2(h)
-        #h = self.bn2[self._train_set](h)
+        if sess is not None:
+            modh = torch.empty_like(h)
+            usess = np.unique(sess)
+            for s in usess:
+                # modify channels by session weight.
+                sess_weight = self.session_weights[s].view((1, -1,) + (1,) * self.dim)
+                c = sess_weight.shape[1]
+                sess_weight = c * sess_weight / torch.sum(sess_weight) # sums to 1 * num weights
+                sind = np.nonzero(sess==s)
+                modh[sind] = h[sind].clone() * sess_weight
+            h = modh
         h = self.activation(h)
+        h = self.bn[self._train_set](h)
+        if self._train_model or self._train_mask:
+            h = self.search_dropout(h)
         h = self.conv_3(h)
-        # h = self.renormalize_batch(h)
-        # h = self.activation(h)
-        # if self._train_model or self._train_mask:
-        #     h = self.search_dropout(h)
-        h = self.conv_4(h)
-        # h = self.renormalize_batch(h)
-        # #h = self.bn4[self._train_set](h)
-        # h = self.conv_5(h)
         return h
 
-    def forward(self, stim, top30=False):
+    def forward(self, stim, sess=None, top30=False):
         # compute regularization penalty
         reg = torch.tensor([0.], device=self.device)
         if self._train_model:
             w_l2 = torch.sum(torch.stack([torch.mean(torch.pow(w.weight, 2))
                                           for w in [self.conv_1, self.conv_2, self.conv_3]]))
-            reg += 1.0 * self.spatial_reg_coef * w_l2
+            sess_l2 = torch.mean(torch.square(1 - torch.stack([self.session_weights[s] for s in self.session_weights.keys()])))
+            reg += 1.0 * self.spatial_reg_coef * w_l2 + 1e-3 * sess_l2
         if self._train_mask:
             rw_l2 = torch.mean(torch.square(self.roi_weights[self._train_set]))
             reg += 1.0 * self.lin_reg_coef * rw_l2
-        spatial_logits = self.shared_cov_step(stim)
+        spatial_logits = self.shared_cov_step(stim, sess=sess)
         spatial_logits = spatial_logits.view((-1, self.out_feat) + self.in_spatial)
         logits = self.global_step(spatial_logits, top30=top30) # <n, c, c, x, y, z>
         return logits, reg
 
-    def fit(self, dataloader):
+    def fit(self, dataloader, lr=.01):
         # loss_fxn = torch.nn.MultiMarginLoss(p=2, margin=scale / 2)
+        self.stimbn[self._train_set].train(mode=True)
+        self.bn[self._train_set].train(mode=True)
         if self.pairwise:
             loss_fxn = PairwiseLoss(nclasses=self.n_classes)
         else:
             loss_fxn = torch.nn.MultiMarginLoss(p=2, margin=math.prod(self.in_spatial) * (1 / self.n_classes), reduction="sum")
-        lr = .01
         loss_history = []
         # if self._train_set == self.set_names[0]:
         #     # no bias for first set
         #     bias_param = []
         # else:
-        bias_param = [self.test_bias[self._train_set]]
+        bn_params = list(self.stimbn[self._train_set].parameters()) + list(self.bn[self._train_set].parameters())
+        sess_params = [self.session_weights[s] for s in self.session_weights.keys()]
         if self._train_model and self._train_mask:
             # set optim to use
             params = (list(self.conv_1.parameters()) +
                       list(self.conv_2.parameters()) +
                       list(self.conv_3.parameters()) +
                       [self.roi_weights[self._train_set]] +
-                      bias_param)
-            g_params =  [self.global_weights[self._train_set]]
+                      bn_params + sess_params)
         elif self._train_mask:
-            lr = .01
-            params = [self.roi_weights[self._train_set]] + bias_param
-            g_params = [self.global_weights[self._train_set]]
+            params = [self.roi_weights[self._train_set]] + bn_params
         elif self._train_model:
             # if only training model use CE loss
             params = (list(self.conv_1.parameters()) +
                       list(self.conv_2.parameters()) +
                       list(self.conv_3.parameters()) +
-                      [self.temperature])
+                      [self.temperature]) + bn_params + sess_params
         else:
             raise ValueError("No train mode is set. Optimization would be pointless.")
+        self.bn[self._train_set].train(mode=True)
         optim = torch.optim.Adam(params=params, lr=lr)
-        for i, (stim, target) in enumerate(dataloader):
+        for i, res in enumerate(dataloader):
+            if self.sessions is None:
+                stim, target = res
+                sess = ["all"]*len(target)
+            else:
+                if len(res) != 3:
+                    raise ValueError("session correction is ON, dataloader must yield <stim, target, sess_id>")
+                stim, target, sess = res
+            sess = np.array(sess)
             optim.zero_grad()
             stim = torch.from_numpy(stim).float().to(self.device)
             # track avg img
@@ -1131,37 +1168,22 @@ class ROISearchlightDecoder():
             target = torch.from_numpy(target)
             batch_size = len(target)
             target = target.long().to(self.device)
-            glogits, reg = self.forward(stim)
+            glogits, reg = self.forward(stim, sess=sess)
             # probs = glogits / torch.linalg.norm(glogits, dim=1).unsqueeze(1)
             probs = glogits # * self.temperature
-            if self.pairwise:
-                if self._train_model and not self._train_mask:
-                    # if we're training the model and not the mask we compute loss at each spot before summing.
-                    loss = loss_fxn(probs, target, pairwise_weights=self.pairwise_weights)
-                    probs = probs.mean(dim=3)
-                else:
-                    # if we're training the mask or evaluating we combined logits before loss.
-                    probs = probs.mean(dim=3)
-                    loss = loss_fxn(probs, target, pairwise_weights=self.pairwise_weights)
-                     # batch, cl  * (self.global_weights[self._train_set]).view((1, 1, -1))
+            if self._train_model and not self._train_mask:
+                # if we're training the model and not the mask we compute loss at each spot before summing.
+                loss = loss_fxn(probs, target, pairwise_weights=self.pairwise_weights)
+                probs = probs.mean(dim=3)
             else:
-                tail_dims = probs.ndim - 2
-                test_bias = self.test_bias[self._train_set].reshape((1, self.n_classes) + tuple([1]*tail_dims))
-                probs = probs + test_bias
-                for c in range(self.n_classes):
-                    probs[target==c] = probs[target==c] * self.pairwise_weights[c, c].reshape((1, self.n_classes) + tuple([1]*tail_dims))
-                if self._train_model and not self._train_mask:
-                    loss = loss_fxn(probs, target)
-                    probs = probs.sum(dim=2)
-                else:
-                    probs = probs.sum(dim=2)
-                    loss = loss_fxn(probs, target)
-            # acc = compute_acc(target, glogits, pairwise=True, top=1)
+                # if we're training the mask or evaluating we combined logits before loss.
+                probs = probs.mean(dim=3)
+                loss = loss_fxn(probs, target, pairwise_weights=self.pairwise_weights)
             _, acc = util.confusion_from_pairwise(probs, target, self.n_classes, pairwise_weights=self.pairwise_weights)
             loss = loss + reg  # (1)
             loss_history.append(loss.detach().cpu().item())
             print("Loss Epoch", i, ":", loss_history[-1], "ACC:", acc)
-            optim = util.is_converged(loss_history, optim, batch_size, i)
+            optim, _ = util.is_converged(loss_history, optim, batch_size, i)
             # apply gradients
             loss.backward()
             optim.step()
@@ -1170,38 +1192,83 @@ class ROISearchlightDecoder():
     def predict(self, dataloader, top30=False):
         # set train mask and model to false
         _recall = (self._train_model, self._train_mask)
+        self.bn[self._train_set].train(mode=False)
+        self.stimbn[self._train_set].train(mode=False)
         self.eval(self._train_set)
         roi_accs = {roi: 0. for roi in self.roi_names}
         roi_cm = {roi: np.zeros((self.n_classes, self.n_classes)) for roi in self.roi_names}
         roi_accs["global"] = 0.
         roi_cm["global"] = np.zeros((self.n_classes, self.n_classes))
         count = 1
-        for i, (stim, target) in enumerate(dataloader):
+        session_data = {} # build sictionary of sessions
+        for i, res in enumerate(dataloader):
+            if len(res) == 3:
+                stim, target, sess = res
+                if self.sessions is None:
+                    send_sess = ["all"] * len(target)
+                else:
+                    send_sess = sess
+                use_sess = True
+            elif len(res) == 2:
+                stim, target = res
+                sess = send_sess = ["all"] * len(target)
+                use_sess = False
+            else:
+                raise ValueError
+            sess = np.array(sess)
+            send_sess = np.array(send_sess)
+            unique_sess = np.unique(sess)
             # convert targets to tensors
             stim = torch.from_numpy(stim).float().to(self.device)
             target = torch.from_numpy(target)
             target = target.long().to(self.device)
             with torch.no_grad():
-                gy_hat, reg = self.forward(stim, top30=False)
+                gy_hat, reg = self.forward(stim, top30=False, sess=send_sess)
                 roi_logits = self.roi_step(gy_hat, top30=top30)
                 gy_hat = gy_hat.sum(dim=3)
             for k in roi_logits.keys():
                 if not self.pairwise:
                     roi_logits[k] = roi_logits[k]
                     for c in range(self.n_classes):
-                        roi_logits[k][target == c] = roi_logits[k][target == c] * self.pairwise_weights[c, c].unsqueeze(0)
-                rcm, racc = util.confusion_from_pairwise(roi_logits[k], target, self.n_classes, pairwise_weights=self.pairwise_weights)
+                        roi_logits[k][target == c] = roi_logits[k][target == c] * self.pairwise_weights[c, c].unsqueeze(
+                            0)
+                rcm, racc = util.confusion_from_pairwise(roi_logits[k], target, self.n_classes,
+                                                         pairwise_weights=self.pairwise_weights)
                 roi_accs[k] += racc
                 roi_cm[k] += rcm.squeeze()
-            cm, acc = util.confusion_from_pairwise(gy_hat, target, self.n_classes, pairwise_weights=self.pairwise_weights)
+            cm, acc = util.confusion_from_pairwise(gy_hat, target, self.n_classes,
+                                                   pairwise_weights=self.pairwise_weights)
             # acc = compute_acc(target, gy_hat, pairwise=True, top=1)
             roi_accs["global"] += acc
             roi_cm["global"] += cm
             print("Epoch", i, "ACC:", acc)
+
+            if use_sess:
+                for s in unique_sess:
+                    sind = np.nonzero(sess == s)
+                    gl = gy_hat[sind]
+                    t = target[sind]
+                    cm, acc = util.confusion_from_pairwise(gl, t, self.n_classes,
+                                                           pairwise_weights=self.pairwise_weights)
+                    if s in session_data:
+                        session_data[s]["acc"] += acc * len(t)
+                        session_data[s]["count"] += len(t)
+                    else:
+                        session_data[s] = {"acc": acc * len(t),
+                                           "count": len(t)}
             count += 1
         self.train_model, self._train_mask = _recall
-        roi_accs = {k:roi_accs[k] / count for k in roi_accs.keys()}
-        roi_cm = {k:roi_cm[k] / np.sum(roi_cm[k], axis=1)[None, :] for k in roi_accs.keys()} # normalize confusion matrices
+        roi_accs = {k: roi_accs[k] / count for k in roi_accs.keys()}
+        roi_cm = {k: roi_cm[k] / np.sum(roi_cm[k], axis=1)[None, :] for k in
+                  roi_accs.keys()}  # normalize confusion matrices
+        if use_sess:
+            sessions = sorted(list(session_data.keys()))
+            session_accs = [session_data[k]["acc"] / session_data[k]["count"] for k in sessions]
+            fig, ax = plt.subplots(1)
+            fig.set_size_inches(18, 18)
+            ax.bar(sessions, height=session_accs)
+            ax.set_xticklabels(sessions, visible=True, rotation=40)
+            plt.show()
         return roi_accs, roi_cm
 
     def get_saliancy(self, inset, baseline=None):
@@ -1214,7 +1281,7 @@ class ROISearchlightDecoder():
     def get_bias(self, inset, class_id):
         if inset not in self.set_names:
             raise ValueError
-        b = self.gaussian_smoothing(self.test_bias[inset], unit_range=False)
+        b = self.gaussian_smoothing(self.first_bias[inset], unit_range=False)
         b = b[:, class_id].view((1, 1,) + self.in_spatial).squeeze()
         return b.detach().cpu().numpy()
 

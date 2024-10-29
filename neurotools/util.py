@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import List, Union
 
@@ -7,6 +8,46 @@ import networkx as nx
 import pandas as pd
 from scipy import stats
 import itertools
+
+
+class StratifiedSampler:
+    def __init__(self, full_df, n_folds, target_col, strat_cols=()):
+        """
+        Parameters
+        ----------
+        full_df: Full dataframe of stimulus and targets.
+        n_folds: number of cross validation folds
+        target_col: col with class labels
+        strat_cols: other cols that should have values evenly distributed.
+        """
+        self.og_df = full_df
+        self.n_folds = n_folds
+        self.folds = [pd.DataFrame(columns=full_df.columns) for _ in range(n_folds)]
+        self.target_col = target_col
+        self.strat_col = strat_cols + [self.target_col]
+        self._stratified_split_balanced()
+
+    def _stratified_split_balanced(self,):
+        df = self.og_df
+        strat_cols = self.strat_col
+        k = self.n_folds
+
+        # Group the DataFrame by the specified stratification columns
+        grouped = df.groupby(strat_cols)
+
+        # Loop over each group and distribute rows in a round-robin manner
+        counter = 0  # Counter to keep track of DataFrame index in round-robin
+        for _, group in grouped:
+            for _, row in group.iterrows():
+                self.folds[counter % k] = pd.concat([self.folds[counter % k], pd.DataFrame([row])], ignore_index=True)
+                counter += 1
+
+    def get_train(self, idx):
+        data = pd.concat(self.folds[:idx] + self.folds[idx + 1:], ignore_index=True)
+        return data
+
+    def get_test(self, idx):
+        return self.folds[idx]
 
 
 def balance_classes(df, class_col, n=None):
@@ -77,7 +118,7 @@ def atlas_from_list(masks: List[np.ndarray], names: List, thresh=.5):
     masks = masks > thresh
     tie = (np.sum(masks, axis=0) > 1)
     atlas = np.argmax(masks, axis=0) # 0 needs to indicate background
-    atlas[tie] = len(names)
+    atlas[tie] = len(names) + 1
     padded = np.pad(atlas, 1)
     for t in np.argwhere(tie):
         # iterate over ties and replace with nearest
@@ -251,7 +292,8 @@ def is_converged(loss_history, optim, batch_size, t):
     :param loss_history:
     :return:
     """
-    check_size = (2000 // batch_size)
+    check_size = min((2000 // batch_size), 100)
+    set_lr = 1.
     if ((t + 1) % check_size) == 0:
         # reduce learn rate if not improving and check to stop early...
         d_last_block = np.mean(np.array(loss_history[-3*check_size:-2*check_size]))
@@ -267,8 +309,9 @@ def is_converged(loss_history, optim, batch_size, t):
             elif t > 3*check_size and block < last_block < d_last_block:
                 # reheat on slope
                 g['lr'] = min(g['lr'] * 8.0, .01)
+            set_lr = g['lr']
         print("EPOCH", t, "LOSS", block)
-    return optim
+    return optim, set_lr < 1e-8
 
 
 def conv_identity_params(in_spatial, desired_kernel, stride=1):
@@ -426,6 +469,40 @@ def atlas_to_list(data_matrix, atlas, ignore_atlas_base=True, min_dim=0):
     return class_data_list, unique_filtered
 
 
+def atlas_to_mask(atlas, lookup: dict, hemi_axis=None):
+    """
+    converts an atlas to a list of binary masks
+    lookup dict roi_name:atlas_val
+    """
+    if type(atlas) is torch.Tensor:
+        atlas = atlas.detach().cpu().numpy()
+    atlas = atlas.astype(int)
+    out_rois = []
+    for roi_id in lookup.keys():
+        o = np.zeros_like(atlas).astype(float)
+        o[atlas == lookup[roi_id]] = 1.
+        if hemi_axis is not None:
+            split_dex = atlas.shape[hemi_axis] // 2
+            o = np.moveaxis(o, hemi_axis, 0)
+            ob = np.zeros_like(o)
+            ob[split_dex:] = copy.deepcopy(o[split_dex:])
+            o[split_dex:] = 0
+            o = np.moveaxis(o, 0, hemi_axis)
+            ob = np.moveaxis(ob, 0, hemi_axis)
+            out_rois.append(o)
+            out_rois.append(ob)
+        else:
+            out_rois.append(o)
+    if hemi_axis is not None:
+        names = []
+        for n in lookup.keys():
+            names.append(n + "_lh")
+            names.append(n + "_rh")
+    else:
+        names = list(lookup.keys())
+    return out_rois, names
+
+
 def triu_to_square(triu_vector, n, includes_diag=False, negate=False):
     """
     Converts an upper triangle vector to a full (redundant) symmetrical square matrix.
@@ -477,8 +554,8 @@ def confusion_from_pairwise(scores, gt, nclasses, pairwise_weights=None):
     cm = torch.zeros((nclasses, nclasses,) + tuple(spatial), dtype=torch.float)
     for c in classes:
         to_consider = pairwise_weights[c, c].detach().cpu()
-        num_considered = torch.count_nonzero(to_consider)
         d = X[y == c]
+        num_considered = torch.count_nonzero(to_consider) - 1
         scores = d[:, c]
         scores = scores * to_consider.unsqueeze(0) # zeros not considered scored
         cm[c, c] += torch.count_nonzero(scores > 0)
@@ -488,5 +565,6 @@ def confusion_from_pairwise(scores, gt, nclasses, pairwise_weights=None):
                 continue
             cm[c, pred_c] += pred_tally[pred_c]
     full_acc = torch.sum(torch.diagonal(cm)) / torch.sum(cm)
+    full_acc -= .5 # diff from chance.
     cm[torch.arange(nclasses), torch.arange(nclasses)] /= num_considered # scale for viewing
     return cm.squeeze().detach().numpy(), full_acc.detach().item()
