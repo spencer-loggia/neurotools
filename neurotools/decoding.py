@@ -836,6 +836,8 @@ class SpatialBN(torch.nn.Module):
         self.last = None
         self.std_memory = None
         self.mean_memory = None
+        self.train_std = None
+        self.train_mean = None
         self.offset = torch.nn.Parameter(torch.tensor([0.], device=device))
         self.scale = torch.nn.Parameter(torch.tensor([1.], device=device))
 
@@ -843,23 +845,27 @@ class SpatialBN(torch.nn.Module):
         self.to_trian = mode
 
     def forward(self, X):
-        bs = X.shape[0]
         spatial = X.shape[2:]
-        run_discount = bs / 100
-        mem_discount = .2 * run_discount
+        run_discount = .6
+        mem_discount = .92
         if self.to_trian:
             if self.last is None:
                 self.last = X.detach().clone()
-            Xa = self.last * run_discount + (1 - run_discount) * X
-            self.last = Xa.detach()
-            m = Xa.mean(dim=(0, 1)).view((1, 1,) + spatial)
-            s = Xa.std(dim=(0, 1)).view((1, 1,) + spatial) + 1e-8
+            m = X.mean(dim=(0, 1)).view((1, 1,) + spatial)
+            s = X.std(dim=(0, 1)).view((1, 1,) + spatial) + 1e-8
             if self.std_memory is None:
                 self.std_memory = m.detach()
                 self.mean_memory = s.detach()
+                self.train_mean = m
+                self.train_std = s
             else:
                 self.std_memory = mem_discount * self.std_memory + (1 - mem_discount) * s.detach()
                 self.mean_memory = mem_discount * self.mean_memory + (1 - mem_discount) * m.detach()
+
+                self.train_std = run_discount * self.train_std.detach() + (1 - run_discount) * s
+                self.train_mean = run_discount * self.train_mean.detach() + (1 - run_discount) * m
+            m = self.train_mean.clone()
+            s = sefl.train_std.clone()
         else:
             if self.std_memory is None:
                 raise ValueError("Must train SpatialBN first")
@@ -897,7 +903,7 @@ class ROISearchlightDecoder():
             self.pairwise_weights = torch.ones((n_classes, n_classes, n_classes), device=self.device)
         else:
             self.pairwise_weights = pairwise_weights  # mask to use for each input class. Some classes should only be compared to some others.
-        base_chan = int(math.ceil(math.log(n_classes))) + 1
+        base_chan = int(math.ceil(math.log(n_classes))) + 2
         if self.dim == 2:
             ConvConstr = torch.nn.Conv2d
             forward_padding = (0, 1, 0, 1)
@@ -906,7 +912,7 @@ class ROISearchlightDecoder():
             ConvConstr = torch.nn.Conv3d
             forward_padding = (0, 1, 0, 1, 0, 1)
             reverse_padding = (1, 0, 1, 0, 1, 0)
-        _first_out = 4
+        _first_out = 5
         self.out_feat = n_classes
         self.conv_1 = VarConvND(in_channels=in_channels, out_channels=_first_out, kernel_size=2,
                                 padding=reverse_padding,
