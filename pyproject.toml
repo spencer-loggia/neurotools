@@ -1,0 +1,11 @@
+[project]
+dynamic = ["version", "license", "readme"]
+name = "neurotools"
+description = "Cool tools for awesome science stuff."
+authors = [
+    { name = "Spencer R. Loggia", email = "spncer.loggia98@gmail.com" }
+]
+
+
+[tool.setuptools]
+packages = ["neurotools", "embodied"]
