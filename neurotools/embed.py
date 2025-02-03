@@ -1,11 +1,46 @@
 import numpy as np
 import torch
+from scipy.linalg import eigvals
+
 from neurotools import util
+
+
+class PCA:
+    """
+    Just a helper class to provide a quick torch based PCA in sklearn style. Used for initialization by MDS.
+    """
+    def __init__(self, n_components, device):
+        self.n_components = n_components
+        self.device = device
+        self.components = None
+        self.var_exp = None
+
+    def fit(self, X):
+        """
+        :param X: items x features
+        :return:
+        """
+        cov = torch.cov(X.to(self.device))
+        eigvals, eigvecs = torch.linalg.eig(cov)
+        self.var_exp = torch.abs(eigvals[:self.n_components]) / torch.sum(torch.abs(eigvals))
+        self.components = eigvecs[:, :self.n_components]
+
+    def predict(self, X):
+        """
+        :param X: items x features
+        :return:
+        """
+        X = X.type(torch.complex64)
+        return X @ self.components
+
+    def fit_transform(self, X):
+        self.fit(X)
+        return self.predict(X)
 
 
 class MDScale:
 
-    def __init__(self, n, embed_dims: int = 2, device='cpu'):
+    def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu'):
         """
         Computes an embedding of n examples into a `embed_dims` space that attempts to maintain the provided pairwise
         distances between examples
@@ -20,6 +55,10 @@ class MDScale:
         self.left_latent = None
         self.device = device
         self.stress_history = None
+        if initialization in ["pca", "xavier"]:
+            self.initialization = initialization
+        else:
+            raise ValueError("Initialization must be either 'pca' or 'xavier'.")
 
     def to(self, device):
         self.device = device
@@ -72,8 +111,16 @@ class MDScale:
     def embed(self, dist_vec, max_iter=2000, tol=.001):
         history = []
         cur_iter = 0
-        embedding = torch.empty((self.num_items, self.components)).to(self.device)
-        embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(embedding))
+        if self.initialization == "xavier":
+            embedding = torch.empty((self.num_items, self.components)).to(self.device)
+            embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(embedding))
+        elif self.initialization == "pca":
+            pca = PCA(n_components=self.components, device=self.device)
+            embedding = pca.fit_transform(util.triu_to_square(dist_vec, self.num_items).squeeze()).real.float().detach()
+            embedding = torch.nn.Parameter(embedding)
+        else:
+            raise ValueError
+
         optimizer = torch.optim.Adam(lr=.1, params=[embedding])
         dist_vec = dist_vec.to(self.device)
         cur_iter = 0
@@ -165,7 +212,7 @@ class SupervisedEmbed:
             triu = torch.triu_indices(len(unique_targets), len(unique_targets), offset=1)
             dist_mask = dist_mask[triu[0], triu[1]]
         self.components = torch.empty((n_features, self.n_components))
-        self.components = torch.nn.Parameter(torch.nn.init.xavier_normal_(self.components).to(self.device))
+        self.components = torch.nn.Parameter(torch.nn.init.kaiming_normal_(self.components).to(self.device))
         cur_iter = 0
         history = []
         optimizer = torch.optim.AdamW(lr=.01, params=[self.components])
@@ -215,3 +262,4 @@ class SupervisedEmbed:
     def predict(self, X):
         embed = X.cpu() @ self.components
         return embed.detach().cpu()
+
