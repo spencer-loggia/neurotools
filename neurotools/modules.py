@@ -176,3 +176,68 @@ class VarConvND(torch.nn.Module):
 
     def eval(self):
         self.train(mode=False)
+
+
+class BalancedCELoss(torch.nn.Module):
+    """
+    """
+
+    def __init__(self, nclasses, device="cpu", rebalance=True, spatial=None, margin=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nclasses = nclasses
+        self.loss_fxn = torch.nn.NLLLoss(reduction="none")
+        self.exp_scores = int(nclasses * (nclasses - 1) / 2)
+        self.use_rebalancing = rebalance
+        self.spatial = spatial
+        if spatial is None:
+            spatial = (1,)
+        self.rebalance = (1 / self.nclasses) * torch.ones((self.nclasses,) + (math.prod(spatial),), device=device)
+        self.chance_ce = self.loss_fxn(torch.log_softmax(torch.tensor([0.] * 3), dim=0).unsqueeze(0),
+                                       torch.tensor([1], dtype=torch.long)).sum()
+
+    def forward(self, X, y, true_target=None):
+        """
+        Args:
+            X: <n, c, ...>
+            y: <n,>
+
+        Returns:
+        """
+        tailing_dim = X.ndim - 2
+        y = torch.tile(y.view((-1,) + tuple([1] * tailing_dim)), ((1,) + X.shape[2:]))
+        loss = self.loss_fxn(X, y)
+
+        if self.use_rebalancing:
+            if self.spatial is None:
+                sum_dim = None
+            else:
+                sum_dim = 0
+            if true_target is None:
+                true_target = y
+            max_mix = .75
+            balanced_loss = torch.zeros_like(self.rebalance)
+            class_occ = torch.tensor([0] * self.nclasses, device=X.device)
+            # compute loss by class
+            for c in range(self.nclasses):
+                ind = true_target==c
+                class_occ[c] = ind.sum()
+                if class_occ[c] == 0:
+                    class_occ[c] = 1
+                    balanced_loss[c] = self.chance_ce
+                else:
+                    closs = loss[true_target == c].sum(dim=sum_dim)
+                    balanced_loss[c] = closs
+            with torch.no_grad():
+                # need to change into 0 to 1 vector.
+                class_occ = class_occ.unsqueeze(1)
+                mix_frac = max_mix * class_occ / class_occ.sum()
+                mean_loss = (balanced_loss / class_occ) ** 2
+                total_m_loss = mean_loss.sum(dim=sum_dim, keepdim=True)
+                norm_loss = mean_loss / total_m_loss # sums to one, percent of total loss.
+                # mix with past rebalancing using mix factor
+                self.rebalance = (1 - mix_frac) * self.rebalance + mix_frac * norm_loss
+            # balance all losses by rebalancing factor
+            balanced_loss = self.nclasses * balanced_loss * self.rebalance.detach()
+            loss = balanced_loss.sum()
+
+        return loss
