@@ -51,7 +51,7 @@ def _pearson_pairwise(arr: torch.Tensor):
 
 def pdist_general(X: torch.Tensor, metric, **kwargs):
     """
-    Slow pdist only for small(ish) number of comparisons with arbitrary distane function.
+    Slow pdist only for small(ish) number of comparisons with arbitrary distance function.
     arr should be 3D <batch x observations(v) x conditions (k) >
     """
     b, n, f = X.shape

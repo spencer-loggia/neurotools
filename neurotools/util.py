@@ -222,7 +222,7 @@ def is_converged(loss_history, optim, batch_size, t, max_lr=.01):
                 g['lr'] = min(g['lr'] * 8.0, max_lr)
             set_lr = g['lr']
         print("EPOCH", t, "LOSS", block)
-    return optim, set_lr < max_lr * 1e-7
+    return optim, set_lr < max_lr * 1e-8
 
 
 def conv_identity_params(in_spatial, desired_kernel, stride=1):

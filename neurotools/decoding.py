@@ -46,7 +46,7 @@ class ROISearchlightDecoder():
     def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str], nonlinear=False, spatial=(64, 64, 64),
                  in_channels=2, n_classes=2, device="cuda", pairwise_comp=None, n_layers=3, base_kernel_size=2, 
                  smooth_kernel_sigma=1.0, latent_channels=3, dropout_prob=.3, seed=42, share_conv=False, 
-                 weight_reg_coef=1e-5, conv_reg_coef=1e-4):
+                 weight_reg_coef=1e-4, conv_reg_coef=1e-4, combination_mode="stack"):
         """
         A class that applies a layered searchight to 2D or 3D data, giving a class prediction at each point in space.
         Additionally, can group over regions of space (provided in atlas) and provide performance measure grouped over
@@ -71,6 +71,10 @@ class ROISearchlightDecoder():
         :param share_conv: bool, whether to share weights between layers.
         :param weight_reg_coef: float, final weight regularization coefficient.
         :param conv_reg_coef: float, spatial conv regularization coefficient.
+        :param combination_mode: str, combination mode, either "stack" or "entropy". Entropy compute weights using a
+                                heuristic that weights each spot based on prediction confidence. Stack fits a new model
+                                create a weighting distribution over all searchlight spot. "entropy" generally produces a
+                                higher entropy distribution, while "stack" is more prone to overfitting.
         """
         self.atlas = atlas
         self.seed = seed
@@ -122,6 +126,7 @@ class ROISearchlightDecoder():
             self.mask[roi] = 1
         self.total_features = math.prod(spatial)
         self.mask = torch.from_numpy(self.mask).to(self.device).float()
+        self.combination_mode = combination_mode
         self.initialize_params()
 
     def initialize_params(self):
@@ -264,6 +269,24 @@ class ROISearchlightDecoder():
             w_l2 = torch.sum(torch.stack([torch.sum(torch.pow(w.weight, 2))
                                           for w in self.conv_layers]))
             reg += self.spatial_reg_coef * w_l2
+        if self._train_mask:
+            # compute stack weight regularization
+            w_l2 = torch.sum(torch.square(self.weights))
+            reg += self.lin_reg_coef * w_l2
+            # determining search spot weighting
+            if self.combination_mode == "stack":
+                # using stacking
+                lw = torch.log_softmax(weights.flatten(), dim=0).view(weights.shape)
+            elif self.combination_mode == "entropy":
+                # using confidence
+                lw = torch.log(weights)
+            else:
+                raise ValueError
+            lw = torch.clip(lw, -25, 25)
+
+            # weight prob dist at each searchlight spot by confidence matrix.
+            lw = lw.view((1, 1, -1))
+            spatial_logits = spatial_logits + lw
 
         # compute log probs for each search spot and stabalize
         spatial_logits = torch.log_softmax(spatial_logits, dim=1)
@@ -273,15 +296,9 @@ class ROISearchlightDecoder():
             sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
             spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
 
-        # weight prob dist at each searchlight spot by confidence matrix.
-        weights = weights.view((1, 1, -1))
-        if not self._train_model and not self._train_mask:
-            spatial_logits = spatial_logits + torch.log(weights)
-
         # apply an entropy regularization penalty to all spots.
-        spatial_entropy = 1e-5 * torch.sum(torch.exp(spatial_logits) * spatial_logits)
+        spatial_entropy = 1e-6 * torch.sum(torch.exp(spatial_logits) * spatial_logits)
         reg = reg - spatial_entropy
-
         return spatial_logits, reg
 
     def shared_cov_step(self, stim):
@@ -373,17 +390,17 @@ class ROISearchlightDecoder():
             self.bn_layers[i][self._train_set] = self.bn_layers[i][self.set_names[0]].clone()
             self.bn_layers[i][self._train_set].train(mode=bn_train)
             # set the normalizer to the spatial BN layer for this set type
-            self.conv_layers[i].normalizer = self.bn_layers[i][self._train_set]
 
         loss_history = []
         search_params = []
         for l in self.conv_layers:
             search_params += list(l.parameters())
+        optims = []
         if self._train_model:
             # set optim to use
-            optims = [torch.optim.Adam(params=search_params, lr=lr)]
-        elif self._train_mask:
-            optims = []
+            optims += [torch.optim.Adam(params=search_params, lr=lr)]
+        elif self._train_mask and self.combination_mode == "stack":
+            optims += [torch.optim.Adam(params=[self.weights], lr=lr)]
         else:
             raise ValueError("No train mode is set. Optimization would be pointless.")
         # count batches
@@ -404,27 +421,27 @@ class ROISearchlightDecoder():
             if (i % 100) == 0:
                 print(loss_fxn.rebalance.mean(dim=1))
             loss = loss + reg
-            if self._train_mask:
+            if self._train_mask and self.combination_mode == "entropy":
                 # compute entropy reduction at each spatial location on each trial
                 n_op = logprobs.shape[1]
                 # reduction in entropy from chance
                 hr = (logprobs * torch.exp(logprobs)).sum(dim=1) + math.log(n_op)
                 hr = hr.mean(dim=0).view(self.in_spatial)
                 self.weights.data = self.weights.data + hr
+            else:
+                loss.backward()
+                for o in range(len(optims)):
+                    optims[o], _ = util.is_converged(loss_history, optims[o], batch_size, i)
+                    optims[o].step()
             loss_history.append(loss.detach().cpu().item())
             print("Loss Epoch", i, ":", loss.detach().cpu().item(),
                   "Reg:", reg.detach().cpu().item(),
                   "ACC:", acc)
             # apply gradients
-            if self._train_model:
-                loss.backward()
-                for o in range(len(optims)):
-                    optims[o], _ = util.is_converged(loss_history, optims[o], batch_size, i)
-                    optims[o].step()
             count += 1
 
         # scale the summed confidence weights by number of batches
-        if self._train_mask:
+        if self._train_mask and self.combination_mode == "entropy":
             self.weights.data = self.weights.data / (count + 1)
 
     def predict(self, dataloader, top30=False):
@@ -538,6 +555,8 @@ class ROISearchlightDecoder():
         """
         w = self.weights.view((1, -1,) + self.in_spatial)
         weights = self.gaussian_smoothing(w, unit_range=True).squeeze()
+        if self.combination_mode == "stack":
+            weights = torch.softmax(weights.flatten(), dim=0)
         weight_dist = weights.reshape(self.in_spatial)
         return weight_dist.detach().cpu().numpy()
 
