@@ -108,8 +108,8 @@ def subset_accuracy(X, y):
     class_correct = pred == target
     correct.append(class_correct)
     correct = torch.concatenate(correct, dim=0).float()
-    acc = torch.mean(correct, dim=0)
-    return acc.detach().cpu().numpy().squeeze()
+    acc = torch.mean(correct, dim=0, keepdim=True)
+    return acc.detach().cpu().numpy()
 
 
 class ROISearchlightDecoder():
@@ -238,22 +238,19 @@ class ROISearchlightDecoder():
                 # apply seperate filter to every spatial loc.
                 self.conv_layers.append(
                     VarConvND(in_channels=in_chan, out_channels=out_chan, kernel_size=self.base_kernel_size,
-                              padding=pad, spatial=self.in_spatial, ndims=self.dim, bias=False, standardize=False,
+                              padding=pad, spatial=self.in_spatial, ndims=self.dim, bias=False,
                               dtype=torch.float, device=self.device, generator=generator))
         self.bn = {}
-        self.sess_chan_map = {}
         # initialize weights from searchlights to rois
-        self.weights = {}
-        for s in self.set_names:
-            # just one weight at each loc in space
-            weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
-            weight = torch.nn.Parameter(torch.nn.init.ones_(weight).float())
-            self.weights[s] = torch.nn.Parameter(weight.data.clone())
+        # just one weight at each loc in space
+        weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
+        weight = torch.nn.Parameter(torch.nn.init.ones_(weight).float())
+        self.weights= torch.nn.Parameter(weight.data.clone())
 
     def reset_weights(self, set):
         weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
         weight = torch.nn.Parameter(torch.abs(torch.nn.init.ones_(weight)))
-        self.weights[set] = weight
+        self.weights = weight
 
     def train_searchlight(self, set, on=True):
         if set not in self.set_names:
@@ -434,7 +431,7 @@ class ROISearchlightDecoder():
             # apply loss after mean over searchlights
             # need to scale by number of spatial
             loss = loss + self.total_features * loss_fxn(probs, target, true_target=true_target)
-        cm, acc = subset_accuracy(probs, target)
+        acc = subset_accuracy(probs, target)
         return loss, acc
 
     def fit(self, dataloader, lr=.01):
@@ -511,7 +508,6 @@ class ROISearchlightDecoder():
             self.conv_layers[i].normalizer = self.bn_layers[i][self._train_set]
         self.eval(self._train_set)
         roi_accs = {roi: 0. for roi in self.roi_names}
-        roi_cm = {roi: np.zeros((self.n_classes, self.n_classes)) for roi in self.roi_names}
         spatial_accs = []
         spatial_sals = []
         roi_accs["global"] = 0.
@@ -536,12 +532,12 @@ class ROISearchlightDecoder():
                     idxs = self.roi_indexes[j]
                     rce, racc = self._get_loss(sgy_hat[:, :, idxs], target, loss_fxn)
                     roi_accs[k] += racc
-                cm, acc = subset_accuracy(gy_hat, target)
+                acc = subset_accuracy(gy_hat, target)
                 roi_accs["global"] += acc
                 print("Epoch", i, "ACC:", acc)
 
                 # compute spatial accuracy map
-                _, acc_map = subset_accuracy(sgy_hat, target, pairwise_weights=self.pairwise_comp)
+                acc_map = subset_accuracy(sgy_hat, target)
                 acc_map = acc_map.reshape(self.in_spatial)
                 spatial_accs.append(acc_map)
             sal = sgy_hat[np.arange(len(target)), target].reshape((-1,) + self.in_spatial)
@@ -551,7 +547,7 @@ class ROISearchlightDecoder():
         roi_accs = {k: roi_accs[k] / count for k in roi_accs.keys()}
         acc_map = np.stack(spatial_accs).mean(axis=0)
         sal_map = np.abs(np.concatenate(spatial_sals)).mean(axis=0)
-        return roi_accs, roi_cm, acc_map, sal_map
+        return roi_accs, acc_map, sal_map
 
     def get_latent(self, dataloader, level="last", metric="euclidian", average=True):
         # turn on latent state tracking
