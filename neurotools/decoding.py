@@ -273,7 +273,16 @@ class ROISearchlightDecoder():
             # compute stack weight regularization
             w_l2 = torch.sum(torch.square(self.weights))
             reg += self.lin_reg_coef * w_l2
-            # determining search spot weighting
+
+        # compute log probs for each search spot and stabalize
+        spatial_logits = torch.log_softmax(spatial_logits, dim=1)
+        spatial_logits = torch.clip(spatial_logits, -25, 0)
+        spatial_logits = spatial_logits.view((batch_size, spatial_logits.shape[1],  -1))
+        if top30:
+            sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
+            spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
+
+        if self._train_mask:
             if self.combination_mode == "stack":
                 # using stacking
                 lw = torch.log_softmax(weights.flatten(), dim=0).view(weights.shape)
@@ -287,14 +296,6 @@ class ROISearchlightDecoder():
             # weight prob dist at each searchlight spot by confidence matrix.
             lw = lw.view((1, 1, -1))
             spatial_logits = spatial_logits + lw
-
-        # compute log probs for each search spot and stabalize
-        spatial_logits = torch.log_softmax(spatial_logits, dim=1)
-        spatial_logits = torch.clip(spatial_logits, -25, 0)
-        spatial_logits = spatial_logits.view((batch_size, spatial_logits.shape[1],  -1))
-        if top30:
-            sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
-            spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
 
         # apply an entropy regularization penalty to all spots.
         spatial_entropy = 1e-6 * torch.sum(torch.exp(spatial_logits) * spatial_logits)
