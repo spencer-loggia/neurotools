@@ -5,10 +5,11 @@ Tools useful for analysis of all different sorts of data, along with application
 - clone the repository to your machine
   - make sure git is installed on your computer
   - copy the link in the code dropdown menu
-  - change your working directory to where you want to put the projec
+  - change your working directory to where you want to put the project
   - in a terminal / power shell / command prompt, run `git clone LINK_YOU_COPIED`
   - This will create a directory called `neurotools` that contains all of the project files, which we will call `REPO_ROOT`
   - Change working directory to `REPO_ROOT`
+  - _These steps are also doable via the graphical GitHub interface on windows_
 - Environment / dependencies setup is easiest with anaconda package manager. Make sure you have anaconda or miniconda installed and added to system path.
   - _On windows installing anaconda also install a conda shell, which can run unix like conda commands. On a unix-like system, conda will be availble in your terminal_
 - Create a new environment with `conda create -n ENV_NAME`
