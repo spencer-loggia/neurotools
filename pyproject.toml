@@ -8,4 +8,4 @@ authors = [
 
 
 [tool.setuptools]
-packages = ["neurotools", "embodied"]
+packages = ["neurotools"]
