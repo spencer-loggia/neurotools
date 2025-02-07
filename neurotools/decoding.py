@@ -46,7 +46,7 @@ class ROISearchlightDecoder():
     def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str], nonlinear=False, spatial=(64, 64, 64),
                  in_channels=2, n_classes=2, device="cuda", pairwise_comp=None, n_layers=3, base_kernel_size=2, 
                  smooth_kernel_sigma=1.0, latent_channels=3, dropout_prob=.3, seed=42, share_conv=False, 
-                 weight_reg_coef=1e-4, conv_reg_coef=1e-4, combination_mode="stack"):
+                 weight_reg_coef=1e-4, conv_reg_coef=1e-4, combination_mode="stack", use_global_weights=True):
         """
         A class that applies a layered searchight to 2D or 3D data, giving a class prediction at each point in space.
         Additionally, can group over regions of space (provided in atlas) and provide performance measure grouped over
@@ -75,6 +75,11 @@ class ROISearchlightDecoder():
                                 heuristic that weights each spot based on prediction confidence. Stack fits a new model
                                 create a weighting distribution over all searchlight spot. "entropy" generally produces a
                                 higher entropy distribution, while "stack" is more prone to overfitting.
+        :param use_global_weights: bool, whether to use global weights. If True, the same weight matrix is trained whenever
+                                `fit` is called with train_mask set to True. Otherwise, a seperate weight matrix is
+                                independently trained for each set. In a cross decoding setting, the former asks -
+                                "How well can I decode B where A can be decoded?" whereas the latter asks - "In what
+                                subset of the voxels that represent A can be best decoded?".
         """
         self.atlas = atlas
         self.seed = seed
@@ -98,6 +103,7 @@ class ROISearchlightDecoder():
         self.n_layers = n_layers
         self.base_kernel_size = base_kernel_size
         self.latent_state_history = []
+        self.use_global_weights = use_global_weights
         self._capture_latent = None # private
 
         if pairwise_comp is None:
@@ -180,7 +186,12 @@ class ROISearchlightDecoder():
         # just one weight at each loc in space
         weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
         weight = torch.nn.Parameter(torch.nn.init.ones_(weight).float())
-        self.weights= torch.nn.Parameter(weight.data.clone())
+        self.weights = {}
+        if self.use_global_weights:
+            self.weights["global"] = torch.nn.Parameter(weight.data.clone())
+        else:
+            for s in self.set_names:
+                self.weights[s] = torch.nn.Parameter(weight.data.clone())
 
     def reset_weights(self, set):
         weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
@@ -255,15 +266,14 @@ class ROISearchlightDecoder():
         Returns: dist roi logits, global logits
         """
         batch_size = spatial_logits.shape[0]
-
-        weights = self.weights
-        weights = weights.view((1, 1,) + self.in_spatial)
-        weights = self.gaussian_smoothing(weights.view((1, 1,) + self.in_spatial))
+        # select correct weight.
+        if self.use_global_weights:
+            weights = self.weights["global"]
+        else:
+            weights = self.weights[self._train_set]
 
         # compute regularization
         reg = torch.tensor([0.], device=self.device)
-        spatial_logits = spatial_logits
-
         if self._train_model:
             # copute regularization penalty
             w_l2 = torch.sum(torch.stack([torch.sum(torch.pow(w.weight, 2))
@@ -271,13 +281,19 @@ class ROISearchlightDecoder():
             reg += self.spatial_reg_coef * w_l2
         if self._train_mask:
             # compute stack weight regularization
-            w_l2 = torch.sum(torch.square(self.weights))
+            w_l2 = torch.sum(torch.square(weights))
             reg += self.lin_reg_coef * w_l2
+
+        # smooth weights.
+        weights = weights.view((1, 1,) + self.in_spatial)
+        weights = self.gaussian_smoothing(weights.view((1, 1,) + self.in_spatial))
 
         # compute log probs for each search spot and stabalize
         spatial_logits = torch.log_softmax(spatial_logits, dim=1)
-        spatial_logits = torch.clip(spatial_logits, -25, 0)
+        spatial_logits = torch.clip(spatial_logits, -25, 0) # numerical stability and such
         spatial_logits = spatial_logits.view((batch_size, spatial_logits.shape[1],  -1))
+
+        # legacy
         if top30:
             sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
             spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
@@ -318,7 +334,6 @@ class ROISearchlightDecoder():
                 h = self.activation(h)  # <batch, c, x, y, z>
                 if self._train_model:
                     h = self.search_dropout(h)
-
         return h
 
     def subset(self, X, y, pairwise_comp):
@@ -397,11 +412,16 @@ class ROISearchlightDecoder():
         for l in self.conv_layers:
             search_params += list(l.parameters())
         optims = []
+
+        if self.use_global_weights:
+            wkey = "global"
+        else:
+            wkey = self._train_set
         if self._train_model:
             # set optim to use
             optims += [torch.optim.Adam(params=search_params, lr=lr)]
         elif self._train_mask and self.combination_mode == "stack":
-            optims += [torch.optim.Adam(params=[self.weights], lr=lr)]
+            optims += [torch.optim.Adam(params=[self.weights[wkey]], lr=lr)]
         else:
             raise ValueError("No train mode is set. Optimization would be pointless.")
         # count batches
@@ -423,12 +443,13 @@ class ROISearchlightDecoder():
                 print(loss_fxn.rebalance.mean(dim=1))
             loss = loss + reg
             if self._train_mask and self.combination_mode == "entropy":
+                # we directly estimate confidence from class distribution.
                 # compute entropy reduction at each spatial location on each trial
                 n_op = logprobs.shape[1]
                 # reduction in entropy from chance
                 hr = (logprobs * torch.exp(logprobs)).sum(dim=1) + math.log(n_op)
                 hr = hr.mean(dim=0).view(self.in_spatial)
-                self.weights.data = self.weights.data + hr
+                self.weights[wkey].data = self.weights[wkey].data + hr
             else:
                 loss.backward()
                 for o in range(len(optims)):
@@ -443,7 +464,7 @@ class ROISearchlightDecoder():
 
         # scale the summed confidence weights by number of batches
         if self._train_mask and self.combination_mode == "entropy":
-            self.weights.data = self.weights.data / (count + 1)
+            self.weights[wkey].data = self.weights[wkey].data / (count + 1)
 
     def predict(self, dataloader, top30=False):
         loss_fxn = BalancedCELoss(nclasses=self.n_classes, device=self.device, rebalance=False)
@@ -505,6 +526,12 @@ class ROISearchlightDecoder():
             assert type(level) is int
             self._capture_latent = level
         self.latent_state_history = []
+
+        if self.use_global_weights:
+            wkey = "global"
+        else:
+            wkey = self._train_set
+
         _recall = (self._train_model, self._train_mask)
         for i in range(self.n_layers):
             self.bn_layers[i][self._train_set].train(mode=False)
@@ -538,7 +565,7 @@ class ROISearchlightDecoder():
             rl_dict = {}
             for j, k in enumerate(self.roi_names):
                 idxs = self.roi_indexes[j]
-                weights = self.weights.flatten()[idxs][:, None].detach().cpu().numpy()
+                weights = self.weights[wkey].flatten()[idxs][:, None].detach().cpu().numpy()
                 assert np.sum(weights < 0)  == 0
                 r_latent = (rdms[idxs] * weights).sum(axis=0, keepdims=True)
                 rl_dict[k] = r_latent
@@ -554,7 +581,12 @@ class ROISearchlightDecoder():
         :param inset: set to get weights for 
         :return: np.ndarray <*spatial>
         """
-        w = self.weights.view((1, -1,) + self.in_spatial)
+        if self.use_global_weights:
+            wkey = "global"
+        else:
+            wkey = self._train_set
+
+        w = self.weights[wkey].view((1, -1,) + self.in_spatial)
         weights = self.gaussian_smoothing(w, unit_range=True).squeeze()
         if self.combination_mode == "stack":
             weights = torch.softmax(weights.flatten(), dim=0)
