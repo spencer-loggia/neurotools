@@ -5,6 +5,15 @@ description = "Cool tools for awesome science stuff."
 authors = [
     { name = "Spencer R. Loggia", email = "spncer.loggia98@gmail.com" }
 ]
+dependencies = [
+    "python >= 3.11",
+    "pytorch == 2.3.*",
+    "matplotlib==3.7.*",
+    "numpy == 1.25.*",
+    "scipy==1.11.*",
+    "pandas==2.0.*",
+    "jupyter",
+]
 
 
 [tool.setuptools]
