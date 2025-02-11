@@ -527,6 +527,11 @@ class ROISearchlightDecoder():
             self._capture_latent = level
         self.latent_state_history = []
 
+        if self.use_global_weights:
+            wkey = "global"
+        else:
+            wkey = self._train_set
+
         _recall = (self._train_model, self._train_mask)
         for i in range(self.n_layers):
             self.bn_layers[i][self._train_set].train(mode=False)
@@ -558,10 +563,12 @@ class ROISearchlightDecoder():
             targets = np.concatenate(targets, axis=0)
             rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy() #  <feature, example>
             rl_dict = {}
-            weights = self.get_saliancy()
             for j, k in enumerate(self.roi_names):
                 idxs = self.roi_indexes[j]
-                weights = weights.flatten()[idxs][:, None]
+                weights = self.weights[wkey].flatten()
+                if self.combination_mode == "stack":
+                    weights = torch.softmax(weights, dim=0)
+                weights = weights[idxs][:, None].detach().cpu().numpy()
                 assert np.sum(weights < 0)  == 0
                 r_latent = (rdms[idxs] * weights).sum(axis=0, keepdims=True)
                 rl_dict[k] = r_latent
