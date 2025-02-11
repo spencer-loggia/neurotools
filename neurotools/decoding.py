@@ -561,7 +561,7 @@ class ROISearchlightDecoder():
             weights = self.get_saliancy()
             for j, k in enumerate(self.roi_names):
                 idxs = self.roi_indexes[j]
-                weights = weights.flatten()[idxs][:, None].detach().cpu().numpy()
+                weights = weights.flatten()[idxs][:, None]
                 assert np.sum(weights < 0)  == 0
                 r_latent = (rdms[idxs] * weights).sum(axis=0, keepdims=True)
                 rl_dict[k] = r_latent
