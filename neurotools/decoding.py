@@ -6,8 +6,6 @@ import torch
 import torch.nn
 from scipy import ndimage
 from torch.nn.functional import conv3d, conv2d
-
-from examples.seachlight_simulation import weights
 from neurotools import util
 from neurotools.modules import VarConvND, SpatialBN, BalancedCELoss
 from neurotools.geometry import dissimilarity_from_supervised
