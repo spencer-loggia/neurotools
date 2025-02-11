@@ -6,6 +6,8 @@ import torch
 import torch.nn
 from scipy import ndimage
 from torch.nn.functional import conv3d, conv2d
+
+from examples.seachlight_simulation import weights
 from neurotools import util
 from neurotools.modules import VarConvND, SpatialBN, BalancedCELoss
 from neurotools.geometry import dissimilarity_from_supervised
@@ -527,11 +529,6 @@ class ROISearchlightDecoder():
             self._capture_latent = level
         self.latent_state_history = []
 
-        if self.use_global_weights:
-            wkey = "global"
-        else:
-            wkey = self._train_set
-
         _recall = (self._train_model, self._train_mask)
         for i in range(self.n_layers):
             self.bn_layers[i][self._train_set].train(mode=False)
@@ -563,9 +560,10 @@ class ROISearchlightDecoder():
             targets = np.concatenate(targets, axis=0)
             rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy() #  <feature, example>
             rl_dict = {}
+            weights = self.get_saliancy()
             for j, k in enumerate(self.roi_names):
                 idxs = self.roi_indexes[j]
-                weights = self.weights[wkey].flatten()[idxs][:, None].detach().cpu().numpy()
+                weights = weights.flatten()[idxs][:, None].detach().cpu().numpy()
                 assert np.sum(weights < 0)  == 0
                 r_latent = (rdms[idxs] * weights).sum(axis=0, keepdims=True)
                 rl_dict[k] = r_latent
