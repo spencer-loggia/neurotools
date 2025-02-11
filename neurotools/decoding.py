@@ -465,6 +465,7 @@ class ROISearchlightDecoder():
         # scale the summed confidence weights by number of batches
         if self._train_mask and self.combination_mode == "entropy":
             self.weights[wkey].data = self.weights[wkey].data / (count + 1)
+        return loss_history
 
     def predict(self, dataloader, top30=False):
         loss_fxn = BalancedCELoss(nclasses=self.n_classes, device=self.device, rebalance=False)
