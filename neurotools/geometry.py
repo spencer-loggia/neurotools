@@ -4,12 +4,12 @@ import torch
 import numpy as np
 from neurotools import util, stats
 
-_distance_metrics_ = ['euclidian', 'pearson', 'spearman', 'dot', 'cosine' ]
+_distance_metrics_ = ['euclidean', 'pearson', 'spearman', 'dot', 'cosine', 'mahalanobis']
 
 
 def _euclidian_pdist(arr: torch.Tensor, order=2):
     """
-    arr should be 3D <batch x observations(v) x conditions (k) >
+    arr should be 3D <batch x features (v) x conditions (k) >
     if normalize is true, equivalent to pairwise cosine similarity
     :param arr:
     :return:
@@ -22,6 +22,31 @@ def _euclidian_pdist(arr: torch.Tensor, order=2):
     pd = pd.pow(1 / order)
     indices = torch.triu_indices(k, k, offset=1)
     return  pd[:, indices[0], indices[1]]
+
+
+def mahalanobis_pdist(arr: torch.Tensor, cov=None):
+    """
+    arr should be 3D <batch x featueres (v) x conditions (k) >
+    if normalize is true, equivalent to pairwise cosine similarity
+    :param arr:
+    :return:
+    """
+    if cov is None:
+        cov = stats.batch_covariance(arr.transpose(1, 2))
+    inv_cov = torch.linalg.pinv(cov)
+    arr = arr.unsqueeze(2)
+    diffs = (arr - arr.transpose(1, 2))
+    # pack diffs
+    ds = diffs.shape
+    k = ds[1]
+    diffs = diffs.reshape((ds[0], -1, ds[-1]))
+    pd = (diffs @ inv_cov).reshape((-1, 1, ds[-1]))  # <b * cond^2, feat>
+    diffs = diffs.reshape((-1, ds[-1], 1))  # <b * cond^2, feat>
+    pd = (pd @ diffs).reshape((ds[0], k, k))  # <b, cond, cond>
+    pd[pd < 0] = 1e-20
+    pd = torch.nan_to_num(pd, nan=1e-20, posinf=1e-20)
+    indices = torch.triu_indices(k, k, offset=1)
+    return pd[:, indices[0], indices[1]]
 
 
 def _dot_pairwise(arr: torch.Tensor, normalize=False):
@@ -49,6 +74,7 @@ def _pearson_pairwise(arr: torch.Tensor):
     coef = coef[:, indices[0], indices[1]]
     return coef.unsqueeze(0)
 
+
 def pdist_general(X: torch.Tensor, metric, **kwargs):
     """
     Slow pdist only for small(ish) number of comparisons with arbitrary distance function.
@@ -65,7 +91,8 @@ def pdist_general(X: torch.Tensor, metric, **kwargs):
             k += 1
     return dm
 
-def dissimilarity(beta: torch.Tensor, metric='dot'):
+
+def dissimilarity(beta: torch.Tensor, metric='dot', cov=None):
     if len(beta.shape) == 2:
         beta = beta.unsqueeze(0)
     elif len(beta.shape) != 3:
@@ -77,10 +104,13 @@ def dissimilarity(beta: torch.Tensor, metric='dot'):
         rdm = max(rdm) - rdm # this may not be ideal
     elif metric == 'cosine':
         rdm = 1 - _dot_pairwise(beta, normalize=True) # take cosine distance to be 1 - cosine similarity
+        rdm[rdm < 0] = 0.
     elif metric == 'pearson':
         rdm = 1 - _pearson_pairwise(beta)
-    elif metric == 'euclidian':
+    elif metric == 'euclidean':
         rdm = _euclidian_pdist(beta)
+    elif metric == 'mahalanobis':
+        rdm = mahalanobis_pdist(beta, cov)
     else:
         raise NotImplementedError
     if torch.sum(rdm < 0) > 0:
@@ -88,7 +118,7 @@ def dissimilarity(beta: torch.Tensor, metric='dot'):
     return rdm
 
 
-def dissimilarity_from_supervised(data, targets, example_weights=None, metric="dot"):
+def dissimilarity_from_supervised(data, targets, example_weights=None, metric="mahalanobis"):
     """
     data is batch, examples, features
     where here batch refers to separate items we're computing the dissimilarity for, and examples refers to
@@ -96,6 +126,10 @@ def dissimilarity_from_supervised(data, targets, example_weights=None, metric="d
     """
     group_labels = list(np.unique(targets))
     group_means = []
+    if metric == "mahalanobis":
+        cov = stats.batch_covariance(data)  # batch, features, features
+    else:
+        cov = None
     for t in group_labels:
         if example_weights is None:
             example_weights = torch.ones(len(data)) / len(data)
@@ -105,7 +139,7 @@ def dissimilarity_from_supervised(data, targets, example_weights=None, metric="d
         group_mean = torch.sum(g*example_weights[:, None, None], dim=1)  # mean across examples
         group_means.append(group_mean)
     group_means = torch.stack(group_means, dim=1)  # build "condition" (target) dimension
-    rdm = dissimilarity(group_means, metric)
+    rdm = dissimilarity(group_means, metric, cov=cov)
     return rdm
 
 

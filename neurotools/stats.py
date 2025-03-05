@@ -4,6 +4,27 @@ from torch.special import gammainc
 from neurotools import util, geometry, embed
 
 
+def batch_covariance(x: torch.Tensor):
+    """
+    X : Tensor, batch, examples, features
+    """
+    x = x.transpose(1, 2)
+    means = x.mean(dim=-1, keepdims=True)
+    cent = (x - means)
+    num = cent @ cent.transpose(1, 2)
+    denom = x.shape[2] - 1
+    cov = num / denom
+    return cov
+
+
+def symmetric_matrix_sqrt(matrix: torch.Tensor):
+    assert matrix.shape[-1] == matrix.shape[-2], "Input must be square matrices"
+    eigvals, eigvecs = torch.linalg.eigh(matrix)
+    sqrt_eigvals = torch.sqrt(torch.clamp(eigvals, min=0))
+    sqrt_matrix = eigvecs @ torch.diag_embed(sqrt_eigvals) @ eigvecs.transpose(-2, -1)
+    return sqrt_matrix
+
+
 def pearson_correlation(x1: torch.Tensor, x2: torch.Tensor, dim=0):
     """
     compute pearson correlation between two vectors in a batched torch friendly wway.
