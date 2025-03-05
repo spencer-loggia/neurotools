@@ -76,10 +76,10 @@ class ROISearchlightDecoder():
                                 create a weighting distribution over all searchlight spot. "entropy" generally produces a
                                 higher entropy distribution, while "stack" is more prone to overfitting.
         :param use_global_weights: bool, whether to use global weights. If True, the same weight matrix is trained whenever
-                                `fit` is called with train_mask set to True. Otherwise, a seperate weight matrix is
+                                `fit` is called with train_mask set to True. Otherwise, a separate weight matrix is
                                 independently trained for each set. In a cross decoding setting, the former asks -
                                 "How well can I decode B where A can be decoded?" whereas the latter asks - "In what
-                                subset of the voxels that represent A can be best decoded?".
+                                subset of the voxels that represent A is B best decoded?".
         """
         self.atlas = atlas
         self.seed = seed
@@ -298,7 +298,7 @@ class ROISearchlightDecoder():
             sinds = torch.argsort(torch.max(spatial_logits, dim=1)[0].mean(dim=0))
             spatial_logits = spatial_logits[:, :, :, sinds[-30:]]
 
-        if self._train_mask:
+        if not self._train_model:
             if self.combination_mode == "stack":
                 # using stacking
                 lw = torch.log_softmax(weights.flatten(), dim=0).view(weights.shape)
@@ -325,7 +325,7 @@ class ROISearchlightDecoder():
             if self._capture_latent is not None and i == self._capture_latent:
                 # capture input to final layer - need to access unfolded state of h.
                 # kinda jank but this is an odd request
-                self.latent_state_history.append(layer._unfold(h).detach().cpu())
+                self.latent_state_history.append(h.detach().cpu())
             if i == 0:
                 h = self.bn_layers[0][self._train_set](h)
             h = layer(h)
@@ -422,8 +422,7 @@ class ROISearchlightDecoder():
             optims += [torch.optim.Adam(params=search_params, lr=lr)]
         elif self._train_mask and self.combination_mode == "stack":
             optims += [torch.optim.Adam(params=[self.weights[wkey]], lr=lr)]
-        else:
-            raise ValueError("No train mode is set. Optimization would be pointless.")
+
         # count batches
         count = 0
         for i, res in enumerate(dataloader):
@@ -519,7 +518,7 @@ class ROISearchlightDecoder():
         sal_map = np.abs(np.concatenate(spatial_sals)).mean(axis=0)
         return roi_accs, acc_map, sal_map
 
-    def get_latent(self, dataloader, level="last", metric="euclidian", average=True):
+    def get_latent(self, dataloader, level="last", metric="mahalanobis", average=True):
         # turn on latent state tracking
         if level == "last":
             self._capture_latent = self.n_layers - 1
@@ -553,16 +552,24 @@ class ROISearchlightDecoder():
                 stim = torch.from_numpy(stim).float().to(self.device)
                 self.forward(stim, target, top30=False)
                 targets.append(target)
-            latent = torch.concatenate(self.latent_state_history, dim=0).detach().cpu()
+            # get latent state
+            latent = torch.concatenate(self.latent_state_history, dim=0).detach().cpu() # <batch, chan, x, y, z>
             kdim = self.base_kernel_size ** self.dim
-            if average:
-                # average over each searchlight embedding entering final layer
-                latent = latent.reshape((latent.shape[0],  latent.shape[1] // kdim, kdim, -1)).mean(dim=2)
-            else:
-                latent = latent.reshape((latent.shape[0], latent.shape[1], -1))
-            latent = latent.permute((2, 0, 1))
             targets = np.concatenate(targets, axis=0)
-            rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy() #  <feature, example>
+            layer = self.conv_layers[self._capture_latent]
+            # if using the first level, features should be over voxels in kernel. Other eise compute rdm at each spatial
+            # location then average over kernel
+            if self._capture_latent == 1:
+                latent = layer._unfold(latent).reshape((latent.shape[0], kdim * self.channels, -1)) # <batch, k * chan, x * y * z>
+                latent = latent.permute((2, 0, 1))
+                rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach()  # <spatial, rdm>
+            else:
+                latent = latent.reshape((latent.shape[0], latent.shape[1], -1))  # <batch, chan, x * y * z>
+                latent = latent.permute((2, 0, 1))
+                rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().T  # <rdm, spatial>
+                rdms = rdms.reshape((rdms.shape[0], 1,) + self.in_spatial)
+                rdms = layer._unfold(rdms).reshape((rdms.shape[0], kdim, -1)) # <rdm, kdim, spatial>
+                rdms = rdms.mean(dim=1).detach().numpy().T # <spatial, rdm>
             rl_dict = {}
             for j, k in enumerate(self.roi_names):
                 idxs = self.roi_indexes[j]
@@ -577,7 +584,7 @@ class ROISearchlightDecoder():
         self._train_model, self._train_mask = _recall
         # disengage latent state tracking
         self._capture_latent = None
-        return  rdms, rl_dict
+        return rdms, rl_dict
 
     def get_saliancy(self):
         """
