@@ -20,7 +20,7 @@ class PCA:
         :param X: items x features
         :return:
         """
-        cov = torch.cov(X.to(self.device))
+        cov = torch.cov(X.T.to(self.device))
         eigvals, eigvecs = torch.linalg.eig(cov)
         self.var_exp = torch.abs(eigvals[:self.n_components]) / torch.sum(torch.abs(eigvals))
         self.components = eigvecs[:, :self.n_components]
