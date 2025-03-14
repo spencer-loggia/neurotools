@@ -49,3 +49,7 @@ class StratifiedSampler:
 
     def get_test(self, idx):
         return self.folds[idx]
+
+    def get_all(self):
+        data = pd.concat(self.folds)
+        return data
