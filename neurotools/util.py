@@ -68,19 +68,16 @@ def get_ranks(x: torch.Tensor, ties=False, rtol=1e-3) -> torch.Tensor:
     if ties:
         tol = -1 * torch.log10((torch.max(x) - torch.min(x)) * rtol).item()
         x = torch.round(x, decimals=round(tol))
-        idx = torch.argsort(x, dim=1)
-        og_ranks = torch.zeros(x.shape, dtype=torch.int)
-        # get ranks with ties
-        for i, b in enumerate(x):
-            ranks = []
-            b = b[idx[i]].tolist()
-            for j, (_, group) in enumerate(itertools.groupby(b)):
-                ranks += [j] * len(list(group))
-            ranks = torch.tensor(ranks, dtype=torch.int)
-            og_ranks[i, idx[i]] = ranks
-    else:
-        tmp = x.argsort(dim=1)
-        og_ranks = take_along_axis(torch.arange(len(x)), tmp, dim=1)
+    idx = torch.argsort(x, dim=1)
+    og_ranks = torch.zeros(x.shape, dtype=torch.int)
+    # get ranks with ties
+    for i, b in enumerate(x):
+        ranks = []
+        b = b[idx[i]].tolist()
+        for j, (_, group) in enumerate(itertools.groupby(b)):
+            ranks += [j] * len(list(group))
+        ranks = torch.tensor(ranks, dtype=torch.int)
+        og_ranks[i, idx[i]] = ranks
     return og_ranks
 
 

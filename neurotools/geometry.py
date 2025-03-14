@@ -26,7 +26,7 @@ def _euclidian_pdist(arr: torch.Tensor, order=2):
 
 def mahalanobis_pdist(arr: torch.Tensor, cov=None):
     """
-    arr should be 3D <batch x featueres (v) x conditions (k) >
+    arr should be 3D <batch x features (v) x conditions (k) >
     if normalize is true, equivalent to pairwise cosine similarity
     :param arr:
     :return:
@@ -51,7 +51,7 @@ def mahalanobis_pdist(arr: torch.Tensor, cov=None):
 
 def _dot_pairwise(arr: torch.Tensor, normalize=False):
     """
-    arr should be 3D <batch x observations(v) x conditions (k) >
+    arr should be 3D <batch x features(v) x conditions (k) >
     if normalize is true, equivalent to pairwise cosine similarity
     :param arr:
     :return:
@@ -67,11 +67,19 @@ def _dot_pairwise(arr: torch.Tensor, normalize=False):
 
 
 def _pearson_pairwise(arr: torch.Tensor):
-    arr = arr.squeeze()
+    """
+    arr should be 3D <batch x features(v) x conditions (k) >
+    if normalize is true, equivalent to pairwise cosine similarity
+    :param arr:
+    :return:
+    """
     k = arr.shape[1]
-    coef = torch.corrcoef(arr)
+    coef = stats.batched_corrcoef(arr)
     indices = torch.triu_indices(k, k, offset=1)
     coef = coef[:, indices[0], indices[1]]
+    coef[coef > 1.] = 1.
+    coef[coef < -1.] = -1.
+    coef = torch.nan_to_num(coef, nan=0., posinf=0., neginf=0.)
     return coef.unsqueeze(0)
 
 
@@ -93,6 +101,10 @@ def pdist_general(X: torch.Tensor, metric, **kwargs):
 
 
 def dissimilarity(beta: torch.Tensor, metric='dot', cov=None):
+    """
+    beta: Tensor, <batch, conditions, features>
+    return: rdm <batch, cond * (cond - 1) / 2>
+    """
     if len(beta.shape) == 2:
         beta = beta.unsqueeze(0)
     elif len(beta.shape) != 3:
@@ -118,7 +130,7 @@ def dissimilarity(beta: torch.Tensor, metric='dot', cov=None):
     return rdm
 
 
-def dissimilarity_from_supervised(data, targets, example_weights=None, metric="mahalanobis"):
+def dissimilarity_from_supervised(data, targets, example_weights=None, metric="euclidean"):
     """
     data is batch, examples, features
     where here batch refers to separate items we're computing the dissimilarity for, and examples refers to
@@ -127,7 +139,7 @@ def dissimilarity_from_supervised(data, targets, example_weights=None, metric="m
     group_labels = list(np.unique(targets))
     group_means = []
     if metric == "mahalanobis":
-        cov = stats.batch_covariance(data)  # batch, features, features
+        cov = stats.batch_covariance(data.transpose(1, 2))  # batch, features, features
     else:
         cov = None
     for t in group_labels:
@@ -135,10 +147,10 @@ def dissimilarity_from_supervised(data, targets, example_weights=None, metric="m
             example_weights = torch.ones(len(data)) / len(data)
         else:
             assert torch.isclose(example_weights.sum(), torch.tensor([1.]))
-        g = data[:, targets == t, :]
-        group_mean = torch.sum(g*example_weights[:, None, None], dim=1)  # mean across examples
+        g = data[:, targets == t, :]  # <batch, examples, features>
+        group_mean = torch.sum(g*example_weights[:, None, None], dim=1)  # mean across examples <batch, variables>
         group_means.append(group_mean)
-    group_means = torch.stack(group_means, dim=1)  # build "condition" (target) dimension
+    group_means = torch.stack(group_means, dim=1)  # <batch, conditions, variables> build "condition" (target) dimension
     rdm = dissimilarity(group_means, metric, cov=cov)
     return rdm
 
@@ -173,17 +185,27 @@ def circle_corr(sample, n, metric="rho"):
     Returns: <batch,> spearman rho or kendalls tau on each batch
     """
     # create circle of items and get distance matrix
-    inds = 2 * torch.pi * torch.arange(n) / n
-    circ_coords = torch.stack([torch.cos(inds), torch.sin(inds)], dim=1).unsqueeze(0)
-    circ_dist = _euclidian_pdist(circ_coords).reshape((1, -1))
-    gt_ranks = util.get_ranks(circ_dist, ties=True)
-    sample_ranks = util.get_ranks(sample, ties=True)
+    # create circle points
+    angles = 2 * torch.pi * torch.arange(n) / n
+    x_coords = np.cos(angles)
+    y_coords = np.sin(angles)
+    points = torch.tensor(np.array([x_coords, y_coords])).float()
+    circ_coords = points.transpose(0, 1).unsqueeze(0)
+    # compute angles between points
+    circ_dist = 1 - _dot_pairwise(circ_coords, normalize=True).reshape((1, -1))
+    if metric in ["rho", "tau"]:
+        gt_ranks = util.get_ranks(circ_dist, ties=True)
+        sample_ranks = util.get_ranks(sample, ties=False)
+    else:
+        # using pearson
+        gt_ranks = circ_dist
+        sample_ranks = sample
     if metric == "tau":
         gt_idx = torch.argsort(gt_ranks, dim=1)
         gt_ranks = util.take_along_axis(gt_ranks, gt_idx, dim=1)
         sample_ranks = util.take_along_axis(sample_ranks, gt_idx, dim=1)
         m = stats._ktau_from_ranks(gt_ranks, sample_ranks.unsqueeze(0))
-    elif metric == "rho":
+    elif metric == "rho" or metric == "pearson":
         m = stats.pearson_correlation(gt_ranks.float(), sample_ranks.float(), dim=1)
     else:
         raise ValueError

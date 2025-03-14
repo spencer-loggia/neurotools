@@ -6,19 +6,36 @@ from neurotools import util, geometry, embed
 
 def batch_covariance(x: torch.Tensor):
     """
-    X : Tensor, batch, examples, features
+    X : Tensor, batch, variables, observations
+    returns <batch, >
     """
-    x = x.transpose(1, 2)
-    means = x.mean(dim=-1, keepdims=True)
+    means = x.mean(dim=-2, keepdims=True)
     cent = (x - means)
-    num = cent @ cent.transpose(1, 2)
+    num = cent @ cent.transpose(1, 2) # <b, v, v>
     denom = x.shape[2] - 1
     cov = num / denom
     return cov
 
 
+def batched_corrcoef(x):
+    """
+    Compute the correlation coefficient for batched data.
+    Args:
+        x (torch.Tensor): Input tensor of shape (batch, variables, observations)
+
+    Returns:
+        torch.Tensor: Correlation matrices of shape (batch, variables, variables)
+    """
+    cov = batch_covariance(x)
+    std_dev = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))  # Standard deviation
+    std_dev_outer = std_dev.unsqueeze(-1) @ std_dev.unsqueeze(-2) # create outer product for each batch.
+    corr = cov / std_dev_outer
+    corr = torch.where(torch.isnan(corr), torch.zeros_like(corr), corr) #handle nan values.
+    return corr
+
+
 def symmetric_matrix_sqrt(matrix: torch.Tensor):
-    assert matrix.shape[-1] == matrix.shape[-2], "Input must be square matrices"
+    assert matzrix.shape[-1] == matrix.shape[-2], "Input must be square matrices"
     eigvals, eigvecs = torch.linalg.eigh(matrix)
     sqrt_eigvals = torch.sqrt(torch.clamp(eigvals, min=0))
     sqrt_matrix = eigvecs @ torch.diag_embed(sqrt_eigvals) @ eigvecs.transpose(-2, -1)
