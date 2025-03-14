@@ -46,7 +46,7 @@ class ROISearchlightDecoder():
     def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str], nonlinear=False, spatial=(64, 64, 64),
                  in_channels=2, n_classes=2, device="cuda", pairwise_comp=None, n_layers=3, base_kernel_size=2, 
                  smooth_kernel_sigma=1.0, latent_channels=3, dropout_prob=.3, seed=42, share_conv=False, 
-                 weight_reg_coef=1e-4, conv_reg_coef=1e-4, combination_mode="stack", use_global_weights=True):
+                 weight_reg_coef=1e-4, conv_reg_coef=1e-4, combination_mode="stack", use_global_weights=True, mask=None):
         """
         A class that applies a layered searchight to 2D or 3D data, giving a class prediction at each point in space.
         Additionally, can group over regions of space (provided in atlas) and provide performance measure grouped over
@@ -105,6 +105,9 @@ class ROISearchlightDecoder():
         self.latent_state_history = []
         self.use_global_weights = use_global_weights
         self._capture_latent = None # private
+        self.mask = mask
+        if type(self.mask) == np.ndarray:
+            self.mask = torch.from_numpy(self.mask).to(self.device)
 
         if pairwise_comp is None:
             self.pairwise_comp = torch.ones((n_classes, n_classes, n_classes), device=self.device)
@@ -124,21 +127,18 @@ class ROISearchlightDecoder():
         self.share_conv = share_conv
         self.lin_reg_coef = weight_reg_coef
         self.spatial_reg_coef = conv_reg_coef
-        self.mask = np.zeros(self.in_spatial)
         for roi_ind in self.lookup.keys():
             roi = self.atlas == roi_ind
             roi_size = np.count_nonzero(roi)
             self.total_features += roi_size
-            self.mask[roi] = 1
         self.total_features = math.prod(spatial)
-        self.mask = torch.from_numpy(self.mask).to(self.device).float()
         self.combination_mode = combination_mode
         self.initialize_params()
 
     def initialize_params(self):
         generator = torch.Generator(device=self.device).manual_seed(self.seed)
         if self.n_layers < 1: raise ValueError
-        self.conv_layers = []
+        # self.conv_layers = []
         # this padding scheme ensures size remains constant, but we must reverse every layer so we don't get offset from
         # input
         p = self.base_kernel_size
@@ -193,10 +193,14 @@ class ROISearchlightDecoder():
             for s in self.set_names:
                 self.weights[s] = torch.nn.Parameter(weight.data.clone())
 
-    def reset_weights(self, set):
-        weight = torch.empty(self.in_spatial, device=self.device, dtype=torch.float)
-        weight = torch.nn.Parameter(torch.abs(torch.nn.init.ones_(weight)))
-        self.weights = weight
+    def _update_setnames(self, set_names):
+        self.set_names = set_names
+        chan_ass = [self.channels] + [self.latent_channels] * (self.n_layers - 1) + [self.n_classes]  # channel sequence
+        for l in range(self.n_layers):
+            in_chan = chan_ass[l]
+            for s in self.set_names:
+                if s not in self.bn_layers:
+                    self.bn_layers[l][s] = SpatialBN(device=self.device, channels=in_chan, n_classes=self.n_classes)
 
     def train_searchlight(self, set, on=True):
         if set not in self.set_names:
@@ -322,12 +326,13 @@ class ROISearchlightDecoder():
         h = stim.float()
         # run through layers
         for i, layer in enumerate(self.conv_layers):
+            if i == 0:
+                h = self.bn_layers[0][self._train_set](h)
             if self._capture_latent is not None and i == self._capture_latent:
                 # capture input to final layer - need to access unfolded state of h.
                 # kinda jank but this is an odd request
                 self.latent_state_history.append(h.detach().cpu())
-            if i == 0:
-                h = self.bn_layers[0][self._train_set](h)
+                continue
             h = layer(h)
             if i < self.n_layers - 1:
                 h = self.bn_layers[i+1][self._train_set](h)
@@ -374,7 +379,10 @@ class ROISearchlightDecoder():
             # no need to track gradients!
             with torch.no_grad():
                 spatial_logits = self.shared_cov_step(stim)
-        mask = (torch.sum(torch.abs(stim), dim=(0, 1)) > 0)
+        if self.mask is None:
+            mask = (torch.sum(torch.abs(stim), dim=(0, 1)) > 0)
+        else:
+            mask = self.mask
         mask = mask.view((1, 1,) + mask.shape)
         spatial_logits = spatial_logits * mask
         # reindex class labels and logits to only compare items in the same group.
@@ -518,7 +526,7 @@ class ROISearchlightDecoder():
         sal_map = np.abs(np.concatenate(spatial_sals)).mean(axis=0)
         return roi_accs, acc_map, sal_map
 
-    def get_latent(self, dataloader, level="last", metric="mahalanobis", average=True):
+    def get_latent(self, dataloader, level="last", metric="pearson", voxelwise=False):
         # turn on latent state tracking
         if level == "last":
             self._capture_latent = self.n_layers - 1
@@ -550,19 +558,22 @@ class ROISearchlightDecoder():
                 else:
                     raise ValueError
                 stim = torch.from_numpy(stim).float().to(self.device)
-                self.forward(stim, target, top30=False)
+                # run forward step
+                with torch.no_grad():
+                    self.shared_cov_step(stim)
                 targets.append(target)
             # get latent state
             latent = torch.concatenate(self.latent_state_history, dim=0).detach().cpu() # <batch, chan, x, y, z>
             kdim = self.base_kernel_size ** self.dim
             targets = np.concatenate(targets, axis=0)
             layer = self.conv_layers[self._capture_latent]
-            # if using the first level, features should be over voxels in kernel. Other eise compute rdm at each spatial
+            # if using the first level, features should be over voxels in kernel. Other wise compute rdm at each spatial
             # location then average over kernel
-            if self._capture_latent == 1:
-                latent = layer._unfold(latent).reshape((latent.shape[0], kdim * self.channels, -1)) # <batch, k * chan, x * y * z>
+            if voxelwise:
+                ch = latent.shape[1]
+                latent = layer._unfold(latent).reshape((latent.shape[0], kdim * ch, -1)) # <batch, k * chan, x * y * z>
                 latent = latent.permute((2, 0, 1))
-                rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach()  # <spatial, rdm>
+                rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy().squeeze()  # <spatial, rdm>
             else:
                 latent = latent.reshape((latent.shape[0], latent.shape[1], -1))  # <batch, chan, x * y * z>
                 latent = latent.permute((2, 0, 1))
@@ -578,7 +589,7 @@ class ROISearchlightDecoder():
                     weights = torch.softmax(weights, dim=0)
                 weights = weights[idxs][:, None].detach().cpu().numpy()
                 assert np.sum(weights < 0)  == 0
-                r_latent = (rdms[idxs] * weights).sum(axis=0, keepdims=True)
+                r_latent = (rdms[idxs] * weights / weights.sum()).sum(axis=0, keepdims=True)
                 rl_dict[k] = r_latent
 
         self._train_model, self._train_mask = _recall
