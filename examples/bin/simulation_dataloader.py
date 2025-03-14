@@ -3,16 +3,17 @@ import math
 import matplotlib.pyplot as plt
 import neurotools
 import numpy as np
-from neurotools import util
+from neurotools import util, geometry
+import torch
 
 """
 Generate examples that simulate the type of fmri data we'd like to see.
 Data is constructed via the following procedure.
-- The data exists in <1, 16, 16, 16> space S. The last 3 of these dimensions are refered to as "spatial", and correspond to the axis of fmri data. 
+- The data exists in <1, 16, 16, 16> space S. The last 3 of these dimensions are referred to as "spatial", and correspond to the axes of fmri data. 
 - we select 2 regions r_1 and r_2, each of which size d and is a contiguous subset of S. 
     - r_1 only has signal when examples from type A are drawn. r_2 has signal when examples from either type A or B are drawn
 - Cross-Signal: Each class is defined as a point on an ellipse in R2 and projected into r_1 and r_2 via a random orthonormal transform.
-    - i.e looking in just one region with size d, each class center is a point on a unit circle on a 2d vector subspace of the d dimmensional ambient space. '
+    - i.e looking in just one region with size d, each class center is a point on a unit circle on a 2d vector subspace of the d dimmensional ambient space.
     - This is the shared signal of A and B
     - random normal jitter is added, weighted by difficulty. 
 - ID signal: The onehot encoding of each class is projected into r_1 and r_2, with a different basis for type A and type B examples. Magnitude wighterd by difficulty 
@@ -22,7 +23,7 @@ Data is constructed via the following procedure.
 """
 
 
-def embed_unit_circles(n, k, d, jitter=0, curve=False, generator=None, basis=None):
+def embed_unit_circles(n, k, d, generator=None, basis=None):
     """
     Helper function
     Embed n points along a unit circle on k parallel planes in a d-dimensional space.
@@ -52,14 +53,7 @@ def embed_unit_circles(n, k, d, jitter=0, curve=False, generator=None, basis=Non
     offset = generator.random() * 2 * np.pi
     angles = np.linspace(offset, 2 * np.pi + offset, n, endpoint=False)
     angles = np.stack([angles + .2 * generator.random() + o * .05 for o in range(k)], axis=1)
-    mod = (generator.random(sd) + 2)
-    mod = sd * mod / np.sum(mod)
-    circle_points = np.stack((mod[0] * np.cos(angles), mod[1] * np.sin(angles)), axis=2)  # Shape (n, k, 2)
-
-    if jitter > 0:
-        # add normal jitter.
-        jitter = generator.normal(size=circle_points.shape, scale=.1 * jitter, loc=0)
-        circle_points = circle_points + jitter
+    circle_points = np.stack((np.cos(angles), np.sin(angles)), axis=2)  # Shape (n, k, 2)
 
     # Embed circle points in the ambient d-dimensional space
     embedded_points = circle_points @ basis.T  # Shape (n, k, d)
@@ -75,15 +69,21 @@ def embed_unit_circles(n, k, d, jitter=0, curve=False, generator=None, basis=Non
     # Create offsets for the parallel planes
     offsets = .5 * np.linspace(-1, 1, k).reshape((1, -1, 1))  # Shape (1, k, 1)
 
-    if curve:
-        curve_offsets = (.1 * generator.random((1, k, 1)) - .05) * np.tile(np.arange(0, n)[:, None, None], (1, k, 1))
-        offsets = offsets + curve_offsets
-
     # Generate points on all planes
     plane_points = embedded_points + offsets * translation_vector
 
     # interleave parallel planes
     return plane_points.reshape((n, k, d))  # Shape (n, k, d)
+
+
+def uniform_embedding(basis, n, d, generator: np.random.Generator):
+    one_hot = np.eye(n)
+    t_basis = generator.normal(size=(12, 12))
+    t_basis, _ = np.linalg.qr(t_basis)
+    basis = (basis @ t_basis).T
+    one_hot = one_hot[generator.choice(np.arange(n), size=n, replace=False)]
+    embed = one_hot @ basis
+    return embed
 
 
 class SimulationDataloader:
@@ -123,11 +123,17 @@ class SimulationDataloader:
         self.sep_signal = {"A": [],
                            "B": []}
         for _ in self.origins:
-            signal = embed_unit_circles(n=self.n_classes // 2, k=2, d=math.prod(self.pat_size), jitter=self.difficulty,
-                                        generator=self.stable_gen).reshape((self.n_classes,) + self.pat_size)
+            basis = self.stable_gen.normal(size=(math.prod(self.pat_size), 12))
+            basis, _ = np.linalg.qr(basis)
+            signal = 1. * embed_unit_circles(n=self.n_classes // 2, k=2, d=math.prod(self.pat_size),
+                                             generator=self.stable_gen, basis=basis[:, :2])
+            signal = signal.reshape((self.n_classes,) + self.pat_size, order="F")
             self.joint_signal.append(signal)
+
             for k in self.sep_signal.keys():
-                self.sep_signal[k] = self.stable_gen.normal(size=signal.shape, scale=.2 * self.difficulty)
+                eb = uniform_embedding(basis, 12, math.prod(self.pat_size),
+                                       generator=self.stable_gen).reshape((self.n_classes,) + self.pat_size)
+                self.sep_signal[k].append(.5 * self.difficulty * eb)
 
         # need to generate a pool of fixed examples for both set types to constrain dataset size.
         data = {}
