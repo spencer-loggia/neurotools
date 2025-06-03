@@ -32,7 +32,3 @@ All core code is contained in the neurotools subdirectory. There are 7 main modu
 - `embed` contains (vaguely) sklearn style classes for dimensionality reduction / visualization
   - Includes a Multidimmensional Scaling Tool and a full implimentation of Sparse Supervised Embedding.
 
-## Running Searchlight Simulator example notebook
-- In the REPO_ROOT directory, with your conda environment ENV_NAME activated, run `jupyter notebook`. This should open and interactive session in your defualt web browser.
-- Navigate to `examples` and open the `searchlight_simulation.ipynb` file. 
-- You can run through the cells for a quick tutorial on using the layered searchlight model and the MDS tool.
