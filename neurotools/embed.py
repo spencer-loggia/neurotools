@@ -23,7 +23,7 @@ class PCA:
         cov = torch.cov(X.T.to(self.device))
         eigvals, eigvecs = torch.linalg.eig(cov)
         self.var_exp = torch.abs(eigvals[:self.n_components]) / torch.sum(torch.abs(eigvals))
-        self.components = eigvecs[:, :self.n_components]
+        self.components = eigvecs[:self.n_components, :].T
 
     def predict(self, X):
         """
@@ -40,7 +40,7 @@ class PCA:
 
 class MDScale:
 
-    def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu'):
+    def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu', struct="euclidean", weights=None):
         """
         Computes an embedding of n examples into a `embed_dims` space that attempts to maintain the provided pairwise
         distances between examples
@@ -54,6 +54,16 @@ class MDScale:
         self.right_latent = None
         self.left_latent = None
         self.device = device
+        self.structure = struct
+        self.weights = weights
+        if self.weights is not None:
+            inds = torch.triu_indices(len(weights), len(weights), offset=1)
+            self.weights = self.weights[inds[0], inds[1]]
+
+        if self.structure == "toroid":
+            self.rad_x = torch.nn.Parameter(torch.tensor(1.))
+            self.rad_y = torch.nn.Parameter(torch.tensor(1.))
+
         self.stress_history = None
         if initialization in ["pca", "xavier"]:
             self.initialization = initialization
@@ -94,6 +104,22 @@ class MDScale:
             raise ValueError("Provided distance matrix / vector is malformed.")
         return dists
 
+    def torus_stress(self, pairwise_target, positions):
+        """
+        interprets positions as angles.
+        """
+        if positions.shape[1] != 2:
+            raise ValueError("embedding must be 2D")
+        cos_p = torch.cos(positions)
+        sin_p = torch.sin(positions)
+        # compute distances:
+        x = (self.rad_x + self.rad_y * cos_p[:, 1]) * cos_p[:, 0]
+        y = (self.rad_x + self.rad_y * cos_p[:, 1]) * sin_p[:, 0]
+        z = self.rad_y * sin_p[:, 1]
+
+        stress = self.stress(pairwise_target, torch.stack([x, y, z], dim=1))
+        return stress
+
     def stress(self, pairwise_target, positions, order=2):
         """
         An L2 Norm between distance in embedding space an actual provided pairwise distances
@@ -105,7 +131,11 @@ class MDScale:
         # stress = self.mse(cur_dists, pairwise_target)
         stress = torch.abs(cur_dists - pairwise_target)
         stress = torch.pow(stress, order)
-        stress = torch.mean(stress)
+        if self.weights is not None:
+            stress = stress * self.weights
+        stress = torch.sum(stress)
+
+        stress = torch.pow(stress, 1 / order)
         return stress
 
     def embed(self, dist_vec, max_iter=2000, tol=.001):
@@ -117,11 +147,14 @@ class MDScale:
         elif self.initialization == "pca":
             pca = PCA(n_components=self.components, device=self.device)
             embedding = pca.fit_transform(util.triu_to_square(dist_vec, self.num_items).squeeze()).real.float().detach()
+            # need a little bit of noise in degenerate case
             embedding = torch.nn.Parameter(embedding)
         else:
             raise ValueError
-
-        optimizer = torch.optim.Adam(lr=.1, params=[embedding])
+        if self.structure == "toroid":
+            optimizer = torch.optim.Adam(lr=.1, params=[embedding, self.rad_x, self.rad_y])
+        else:
+            optimizer = torch.optim.Adam(lr=.1, params=[embedding])
         dist_vec = dist_vec.to(self.device)
         cur_iter = 0
         converged = False
@@ -133,7 +166,11 @@ class MDScale:
                                                                   "convergence tracker is dumb, just be careful!.")
                 break
             optimizer.zero_grad()
-            loss = self.stress(dist_vec, embedding)
+            embedding = embedding # keep of centered!
+            if self.structure == "toroid":
+                loss = self.torus_stress(dist_vec, embedding)
+            else:
+                loss = self.stress(dist_vec, embedding)
             history.append(loss.detach().cpu().item())
             loss.backward()
             optimizer.step()

@@ -1,17 +1,19 @@
+from typing import Union
+
 import numpy as np
 import torch
 from torch.special import gammainc
 from neurotools import util, geometry, embed
 
 
-def batch_covariance(x: torch.Tensor):
+def batch_covariance(x: Union[torch.Tensor, np.ndarray]):
     """
     X : Tensor, batch, variables, observations
     returns <batch, >
     """
     means = x.mean(dim=-2, keepdims=True)
     cent = (x - means)
-    num = cent @ cent.transpose(1, 2) # <b, v, v>
+    num = cent @ cent.swapaxes(1, 2)  # <b, v, v>
     denom = x.shape[2] - 1
     cov = num / denom
     return cov
@@ -35,7 +37,7 @@ def batched_corrcoef(x):
 
 
 def symmetric_matrix_sqrt(matrix: torch.Tensor):
-    assert matzrix.shape[-1] == matrix.shape[-2], "Input must be square matrices"
+    assert matrix.shape[-1] == matrix.shape[-2], "Input must be square matrices"
     eigvals, eigvecs = torch.linalg.eigh(matrix)
     sqrt_eigvals = torch.sqrt(torch.clamp(eigvals, min=0))
     sqrt_matrix = eigvecs @ torch.diag_embed(sqrt_eigvals) @ eigvecs.transpose(-2, -1)

@@ -9,6 +9,7 @@ from torch.nn.functional import conv3d, conv2d
 from neurotools import util
 from neurotools.modules import VarConvND, SpatialBN, BalancedCELoss
 from neurotools.geometry import dissimilarity_from_supervised
+
 import sys
 
 
@@ -45,7 +46,7 @@ def subset_accuracy(X, y):
 class ROISearchlightDecoder():
     def __init__(self, atlas: np.ndarray, lookup: dict, set_names: Tuple[str], nonlinear=False, spatial=(64, 64, 64),
                  in_channels=2, n_classes=2, device="cuda", pairwise_comp=None, n_layers=3, base_kernel_size=2, 
-                 smooth_kernel_sigma=1.0, latent_channels=3, dropout_prob=.3, seed=42, share_conv=False, 
+                 smooth_kernel_sigma=0.0, latent_channels=3, dropout_prob=.3, seed=42, share_conv=False,
                  weight_reg_coef=1e-4, conv_reg_coef=1e-4, combination_mode="stack", use_global_weights=True, mask=None):
         """
         A class that applies a layered searchight to 2D or 3D data, giving a class prediction at each point in space.
@@ -64,9 +65,10 @@ class ROISearchlightDecoder():
                               Defualt behavior is all classes are compared to all others.
         :param n_layers: number of layers
         :param base_kernel_size: kernel size for convolutional layers.
-        :param smooth_kernel_sigma: standard deviation for smoothing kernel for final weights.
+        :param smooth_kernel_sigma: standard deviation for smoothing kernel for final weights. If zero, no smoothing.
         :param latent_channels: number of latent channels between layers.
-        :param dropout_prob: float, dropout probability, e.g. what fraction of weight are randomly zeroed during training.
+        :param dropout_prob: float, dropout probability, e.g. what fraction of weights of intermediate layer are
+                            randomly zeroed during training.
         :param seed: random seed.
         :param share_conv: bool, whether to share weights between layers.
         :param weight_reg_coef: float, final weight regularization coefficient.
@@ -228,6 +230,8 @@ class ROISearchlightDecoder():
         # Create the Gaussian kernel
         sigma = self.smooth_sigma
         kernel_size = int((round(sigma * 2) + .5) * 2) # must be odd.
+        if kernel_size == 0:
+            return None
         if self.dim == 2:
             kernel = np.zeros((kernel_size, kernel_size))
             kernel[kernel_size // 2, kernel_size // 2] = 1
@@ -243,6 +247,10 @@ class ROISearchlightDecoder():
         return kernel_tensor
 
     def gaussian_smoothing(self, tensor, unit_range=True, *args):
+        # if no smoothing return identity
+        if self.smooth_sigma == 0 or self.smooth_kernel is None:
+            return tensor
+        # otherwise smooth spatial dimmensions with kernel
         stride = 1
         oshape = tensor.shape
         sk = self.smooth_kernel.tile((1, 1) + tuple([1] * self.dim)).float()
@@ -257,7 +265,7 @@ class ROISearchlightDecoder():
         else:
             raise RuntimeError("Working dimensionality must be either 2 or 3")
         if smoothed_tensor.shape[-self.dim:] != self.in_spatial:
-            # this should only be triggered if something is mismatched, like kernel size not odd.
+            # this should only be triggered if something is mismatched
             upsampler = torch.nn.Upsample(size=self.in_spatial, mode="nearest")
             smoothed_tensor = upsampler(smoothed_tensor)
         smoothed_tensor = smoothed_tensor.view(oshape)  # batch to channels
@@ -460,7 +468,7 @@ class ROISearchlightDecoder():
             else:
                 loss.backward()
                 for o in range(len(optims)):
-                    optims[o], _ = util.is_converged(loss_history, optims[o], batch_size, i)
+                    optims[o], _ = util.is_converged(loss_history, optims[o], batch_size, i, max_lr=lr)
                     optims[o].step()
             loss_history.append(loss.detach().cpu().item())
             print("Loss Epoch", i, ":", loss.detach().cpu().item(),
@@ -534,6 +542,7 @@ class ROISearchlightDecoder():
             assert type(level) is int
             self._capture_latent = level
         self.latent_state_history = []
+        rdm_size = int(self.n_classes * (self.n_classes - 1) / 2)
 
         if self.use_global_weights:
             wkey = "global"
@@ -573,7 +582,8 @@ class ROISearchlightDecoder():
                 ch = latent.shape[1]
                 latent = layer._unfold(latent).reshape((latent.shape[0], kdim * ch, -1)) # <batch, k * chan, x * y * z>
                 latent = latent.permute((2, 0, 1))
-                rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy().squeeze()  # <spatial, rdm>
+                # compute latent rdms
+                rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy().reshape((latent.shape[0], rdm_size))  # <spatial, rdm>
             else:
                 latent = latent.reshape((latent.shape[0], latent.shape[1], -1))  # <batch, chan, x * y * z>
                 latent = latent.permute((2, 0, 1))
