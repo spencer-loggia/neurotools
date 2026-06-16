@@ -4,7 +4,12 @@ from typing import List, Union
 
 import torch
 import numpy as np
-from scipy import stats
+try:
+    from scipy import stats
+    sci = True
+except Exception as e:
+    print(e)
+    sci = False
 import itertools
 
 
@@ -92,6 +97,8 @@ def atlas_from_list(masks: List[np.ndarray], names: List, thresh=.5):
     Returns: Atlas: np.ndarrray type int, Lookup: pd.DataFrame
     """
     # create atlas
+    if not sci:
+        raise ValueError
     masks = [np.zeros_like(masks[0])] + masks # add background
     masks = np.stack(masks, axis=0)
     masks = masks > thresh
@@ -219,7 +226,7 @@ def is_converged(loss_history, optim, batch_size, t, max_lr=.01):
                 g['lr'] = min(g['lr'] * 8.0, max_lr)
             set_lr = g['lr']
         print("EPOCH", t, "LOSS", block)
-    return optim, set_lr < max_lr * 1e-8
+    return optim, set_lr < max_lr * 1e-12
 
 
 def conv_identity_params(in_spatial, desired_kernel, stride=1):

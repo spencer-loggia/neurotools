@@ -337,10 +337,10 @@ class ROISearchlightDecoder():
             if i == 0:
                 h = self.bn_layers[0][self._train_set](h)
             if self._capture_latent is not None and i == self._capture_latent:
-                # capture input to final layer - need to access unfolded state of h.
+                # capture input to requested layer - need to access unfolded state of h.
                 # kinda jank but this is an odd request
                 self.latent_state_history.append(h.detach().cpu())
-                continue
+                break
             h = layer(h)
             if i < self.n_layers - 1:
                 h = self.bn_layers[i+1][self._train_set](h)
@@ -584,6 +584,7 @@ class ROISearchlightDecoder():
                 latent = latent.permute((2, 0, 1))
                 # compute latent rdms
                 rdms = dissimilarity_from_supervised(latent, targets, metric=metric).detach().numpy().reshape((latent.shape[0], rdm_size))  # <spatial, rdm>
+                rdms = np.clip(rdms, a_min=1e-24, a_max=None)
             else:
                 latent = latent.reshape((latent.shape[0], latent.shape[1], -1))  # <batch, chan, x * y * z>
                 latent = latent.permute((2, 0, 1))
@@ -592,14 +593,17 @@ class ROISearchlightDecoder():
                 rdms = layer._unfold(rdms).reshape((rdms.shape[0], kdim, -1)) # <rdm, kdim, spatial>
                 rdms = rdms.mean(dim=1).detach().numpy().T # <spatial, rdm>
             rl_dict = {}
+            # switched to log to avoid numerica errors
             for j, k in enumerate(self.roi_names):
                 idxs = self.roi_indexes[j]
                 weights = self.weights[wkey].flatten()
                 if self.combination_mode == "stack":
-                    weights = torch.softmax(weights, dim=0)
-                weights = weights[idxs][:, None].detach().cpu().numpy()
-                assert np.sum(weights < 0)  == 0
-                r_latent = (rdms[idxs] * weights / weights.sum()).sum(axis=0, keepdims=True)
+                    weights = torch.log_softmax(weights, dim=0)
+                weights = weights[idxs][:, None].detach().cpu()
+                norm = torch.logsumexp(weights, dim=0).detach().numpy()
+                weights = weights.numpy()
+                # assert np.sum(weights < 0)  == 0
+                r_latent = np.exp((np.log(rdms[idxs]) + weights) - norm).sum(axis=0, keepdims=True)
                 rl_dict[k] = r_latent
 
         self._train_model, self._train_mask = _recall
@@ -607,23 +611,49 @@ class ROISearchlightDecoder():
         self._capture_latent = None
         return rdms, rl_dict
 
-    def get_saliancy(self):
+    def get_saliancy(self, dataloader):
         """
-        Return the smoothed weights.
-        :param inset: set to get weights for 
-        :return: np.ndarray <*spatial>
+        Return the gradient of the loss with respect to each location in the input
+        data, averaged in absolute value over all batches in the provided dataloader.
+        :param dataloader: dataloader yielding (stim, target) batches
+        :return: np.ndarray <channels, *spatial>
         """
-        if self.use_global_weights:
-            wkey = "global"
-        else:
-            wkey = self._train_set
+        loss_fxn = BalancedCELoss(nclasses=self.n_classes, device=self.device,
+                                  rebalance=True, spatial=self.in_spatial)
+        # save training state and enable gradient flow through the model
+        _recall = (self._train_model, self._train_mask)
+        self._train_model = True
+        self._train_mask = False
 
-        w = self.weights[wkey].view((1, -1,) + self.in_spatial)
-        weights = self.gaussian_smoothing(w, unit_range=True).squeeze()
-        if self.combination_mode == "stack":
-            weights = torch.softmax(weights.flatten(), dim=0)
-        weight_dist = weights.reshape(self.in_spatial)
-        return weight_dist.detach().cpu().numpy()
+        grad_accum = None
+        count = 0
+        for res in dataloader:
+            stim, target = res
+            stim = torch.from_numpy(stim).float().to(self.device)
+            stim.requires_grad_(True)
+            target = torch.from_numpy(target).long().to(self.device)
+
+            logprobs, sub_target, reg, og_target = self.forward(stim, target)
+            loss, _ = self._get_loss(logprobs, sub_target, loss_fxn,
+                                     true_target=og_target)
+            input_grad, = torch.autograd.grad(loss, stim)
+
+            if input_grad is None:
+                continue
+            # average absolute gradient over batch and channel dimensions -> (*spatial)
+            grad = input_grad.abs().mean(dim=(0)).detach()
+            if grad_accum is None:
+                grad_accum = grad.clone()
+            else:
+                grad_accum = grad_accum + grad
+            count += 1
+
+        # restore training state
+        self._train_model, self._train_mask = _recall
+
+        if grad_accum is None or count == 0:
+            return np.zeros((self.channels,) + self.in_spatial)
+        return (grad_accum / count).cpu().numpy()
 
     def get_model_size(self):
         """

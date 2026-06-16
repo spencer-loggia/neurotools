@@ -182,7 +182,7 @@ class BalancedCELoss(torch.nn.Module):
     """
     """
 
-    def __init__(self, nclasses, device="cpu", rebalance=True, spatial=None, margin=None, *args, **kwargs):
+    def __init__(self, nclasses, device="cpu", rebalance=False, spatial=None, margin=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.nclasses = nclasses
         self.loss_fxn = torch.nn.NLLLoss(reduction="none")
