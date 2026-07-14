@@ -41,7 +41,7 @@ class PCA:
 class MDScale:
 
     def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu', struct="euclidean", weights=None,
-                 toroid_metric="surface"):
+                 toroid_metric="surface", lr=.01):
         """Fit a multidimensional-scaling embedding to pairwise distances.
 
         Parameters
@@ -79,6 +79,7 @@ class MDScale:
         self.left_latent = None
         self.device = device
         self.structure = struct
+        self.lr = lr
         self.toroid_metric = toroid_metric
         self.weights = weights
         if self.weights is not None:
@@ -224,9 +225,9 @@ class MDScale:
         else:
             raise ValueError
         if self.structure == "toroid":
-            optimizer = torch.optim.Adam(lr=.1, params=[embedding, self.log_rad_phi, self.log_rad_theta])
+            optimizer = torch.optim.Adam(lr=self.lr, params=[embedding, self.log_rad_phi, self.log_rad_theta])
         else:
-            optimizer = torch.optim.Adam(lr=.1, params=[embedding])
+            optimizer = torch.optim.Adam(lr=self.lr, params=[embedding])
         dist_vec = dist_vec.to(self.device)
         cur_iter = 0
         converged = False
