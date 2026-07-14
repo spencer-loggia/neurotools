@@ -195,7 +195,6 @@ def affine_from_params(rotations=(0, 0, 0), scale=(1, 1, 1), translate=(0, 0, 0)
 
 def is_converged(loss_history, optim, batch_size, t, max_lr=.01):
     """
-    Legacy, use adam / SGDM momentum threshold to estimate convergence.
     A heuristic metric of whether a model has converged
     :param loss_history:
     :return:

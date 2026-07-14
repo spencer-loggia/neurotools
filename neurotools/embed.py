@@ -40,13 +40,37 @@ class PCA:
 
 class MDScale:
 
-    def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu', struct="euclidean", weights=None):
-        """
-        Computes an embedding of n examples into a `embed_dims` space that attempts to maintain the provided pairwise
-        distances between examples
-        :param n: number of items
-        :param embed_dims: number of dimensions to construct space in
-        :param device: device to use
+    def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu', struct="euclidean", weights=None,
+                 toroid_metric="surface"):
+        """Fit a multidimensional-scaling embedding to pairwise distances.
+
+        Parameters
+        ----------
+        n : int
+            Number of items represented by the pairwise distances.
+        embed_dims : int, default=2
+            Number of Euclidean latent dimensions. ``struct="toroid"`` requires
+            exactly two dimensions, interpreted as the angles ``(phi, theta)``.
+        initialization : {"pca", "xavier"}, default="pca"
+            Initialization used for the latent coordinates.
+        device : str or torch.device, default="cpu"
+            Device used for optimization.
+        struct : {"euclidean", "toroid"}, default="euclidean"
+            Geometry of the latent space. The toroidal model is a generalized
+            Clifford torus embedded in R4 as
+            ``(r_phi*cos(phi), r_phi*sin(phi), r_theta*cos(theta),
+            r_theta*sin(theta))`` and learns the two positive radii independently.
+        weights : torch.Tensor or numpy.ndarray, optional
+            Pairwise stress weights supplied as an ``n`` by ``n`` matrix.
+        toroid_metric : {"surface", "ambient"}, default="surface"
+            Distance used when ``struct="toroid"``. ``"surface"`` uses the
+            intrinsic geodesic distance on the flat torus; ``"ambient"`` uses
+            Euclidean chord distance between the corresponding points in R4.
+
+        Notes
+        -----
+        Toroidal latent coordinates returned by :meth:`predict` are angles in
+        radians with shape ``(n, 2)``, wrapped into the interval ``[0, 2*pi)``.
         """
         self.num_items = n
         self.components = embed_dims
@@ -55,14 +79,20 @@ class MDScale:
         self.left_latent = None
         self.device = device
         self.structure = struct
+        self.toroid_metric = toroid_metric
         self.weights = weights
         if self.weights is not None:
             inds = torch.triu_indices(len(weights), len(weights), offset=1)
             self.weights = self.weights[inds[0], inds[1]]
 
         if self.structure == "toroid":
-            self.rad_x = torch.nn.Parameter(torch.tensor(1.))
-            self.rad_y = torch.nn.Parameter(torch.tensor(1.))
+            if self.components != 2:
+                raise ValueError("struct='toroid' requires embed_dims=2 for the (phi, theta) angles.")
+            if self.toroid_metric not in ["surface", "ambient"]:
+                raise ValueError("toroid_metric must be either 'surface' or 'ambient'.")
+            # Log-parameterization keeps both independently learned radii positive.
+            self.log_rad_phi = torch.nn.Parameter(torch.zeros((), device=self.device))
+            self.log_rad_theta = torch.nn.Parameter(torch.zeros((), device=self.device))
 
         self.stress_history = None
         if initialization in ["pca", "xavier"]:
@@ -72,7 +102,30 @@ class MDScale:
 
     def to(self, device):
         self.device = device
+        if self.structure == "toroid":
+            self.log_rad_phi = torch.nn.Parameter(self.log_rad_phi.detach().to(device))
+            self.log_rad_theta = torch.nn.Parameter(self.log_rad_theta.detach().to(device))
         return self
+
+    @property
+    def rad_phi(self):
+        """Positive radius of the ``phi`` circle in the toroidal model."""
+        return torch.exp(self.log_rad_phi)
+
+    @property
+    def rad_theta(self):
+        """Positive radius of the ``theta`` circle in the toroidal model."""
+        return torch.exp(self.log_rad_theta)
+
+    @property
+    def rad_x(self):
+        """Alias for :attr:`rad_phi`, retained for backwards compatibility."""
+        return self.rad_phi
+
+    @property
+    def rad_y(self):
+        """Alias for :attr:`rad_theta`, retained for backwards compatibility."""
+        return self.rad_theta
 
     def check_dists(self, dist):
         """
@@ -104,21 +157,49 @@ class MDScale:
             raise ValueError("Provided distance matrix / vector is malformed.")
         return dists
 
-    def torus_stress(self, pairwise_target, positions):
-        """
-        interprets positions as angles.
+    def torus_distances(self, positions):
+        """Return upper-triangular distances between toroidal angle pairs.
+
+        ``positions[:, 0]`` and ``positions[:, 1]`` are the ``phi`` and
+        ``theta`` angles. Surface distances are shortest intrinsic paths on the
+        flat torus. Ambient distances are R4 Euclidean chords between points on
+        the generalized Clifford torus.
         """
         if positions.shape[1] != 2:
             raise ValueError("embedding must be 2D")
-        cos_p = torch.cos(positions)
-        sin_p = torch.sin(positions)
-        # compute distances:
-        x = (self.rad_x + self.rad_y * cos_p[:, 1]) * cos_p[:, 0]
-        y = (self.rad_x + self.rad_y * cos_p[:, 1]) * sin_p[:, 0]
-        z = self.rad_y * sin_p[:, 1]
+        if self.structure != "toroid":
+            raise ValueError("toroidal distances require struct='toroid'.")
 
-        stress = self.stress(pairwise_target, torch.stack([x, y, z], dim=1))
-        return stress
+        if self.toroid_metric == "ambient":
+            phi = positions[:, 0]
+            theta = positions[:, 1]
+            positions_r4 = torch.stack([
+                self.rad_phi * torch.cos(phi),
+                self.rad_phi * torch.sin(phi),
+                self.rad_theta * torch.cos(theta),
+                self.rad_theta * torch.sin(theta),
+            ], dim=1)
+            return torch.pdist(positions_r4)
+
+        inds = torch.triu_indices(positions.shape[0], positions.shape[0], offset=1,
+                                  device=positions.device)
+        angle_delta = positions[inds[0]] - positions[inds[1]]
+        angle_delta = torch.remainder(angle_delta + torch.pi, 2 * torch.pi) - torch.pi
+        radii = torch.stack([self.rad_phi, self.rad_theta])
+        return torch.linalg.vector_norm(angle_delta * radii, dim=1)
+
+    def torus_stress(self, pairwise_target, positions, order=2):
+        """Stress between target distances and distances on the toroidal model."""
+        return self.distance_stress(pairwise_target, self.torus_distances(positions), order=order)
+
+    def distance_stress(self, pairwise_target, current_distances, order=2):
+        """Compute stress between two upper-triangular pairwise-distance vectors."""
+        stress = torch.abs(current_distances - pairwise_target)
+        stress = torch.pow(stress, order)
+        if self.weights is not None:
+            stress = stress * self.weights
+        stress = torch.sum(stress)
+        return torch.pow(stress, 1 / order)
 
     def stress(self, pairwise_target, positions, order=2):
         """
@@ -127,16 +208,7 @@ class MDScale:
         :param pairwise_target: upper triangular vector of pairwise distance between examples, size n(n-1) / 2
         :return: torch.Tensor a stress score for the system
         """
-        cur_dists = torch.pdist(positions)
-        # stress = self.mse(cur_dists, pairwise_target)
-        stress = torch.abs(cur_dists - pairwise_target)
-        stress = torch.pow(stress, order)
-        if self.weights is not None:
-            stress = stress * self.weights
-        stress = torch.sum(stress)
-
-        stress = torch.pow(stress, 1 / order)
-        return stress
+        return self.distance_stress(pairwise_target, torch.pdist(positions), order=order)
 
     def embed(self, dist_vec, max_iter=2000, tol=.001):
         history = []
@@ -152,7 +224,7 @@ class MDScale:
         else:
             raise ValueError
         if self.structure == "toroid":
-            optimizer = torch.optim.Adam(lr=.1, params=[embedding, self.rad_x, self.rad_y])
+            optimizer = torch.optim.Adam(lr=.1, params=[embedding, self.log_rad_phi, self.log_rad_theta])
         else:
             optimizer = torch.optim.Adam(lr=.1, params=[embedding])
         dist_vec = dist_vec.to(self.device)
@@ -193,10 +265,16 @@ class MDScale:
         return self.predict()
 
     def predict(self):
+        def output_coordinates(latent):
+            coordinates = latent.detach().cpu()
+            if self.structure == "toroid":
+                coordinates = torch.remainder(coordinates, 2 * torch.pi)
+            return coordinates
+
         if self.left_latent is None:
-            return self.right_latent.detach().cpu()
+            return output_coordinates(self.right_latent)
         else:
-            return self.right_latent.detach().cpu(), self.left_latent.detach().cpu()
+            return output_coordinates(self.right_latent), output_coordinates(self.left_latent)
 
 
 class SupervisedEmbed:
@@ -299,4 +377,3 @@ class SupervisedEmbed:
     def predict(self, X):
         embed = X.cpu() @ self.components
         return embed.detach().cpu()
-

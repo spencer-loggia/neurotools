@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from neurotools import util, stats
 
-_distance_metrics_ = ['euclidean', 'pearson', 'spearman', 'dot', 'cosine', 'mahalanobis']
+_distance_metrics_ = ['euclidean', 'pearson', 'spearman', 'dot', 'cosine', 'mahalanobis', 'hellinger']
 
 
 def _euclidian_pdist(arr: torch.Tensor, order=2):
@@ -83,6 +83,55 @@ def _pearson_pairwise(arr: torch.Tensor):
     return coef.unsqueeze(0)
 
 
+def hellinger_similarity_matrix(distributions: torch.Tensor):
+    """Construct pairwise Hellinger-similarity matrices.
+
+    Parameters
+    ----------
+    distributions : torch.Tensor
+        Nonnegative values with shape ``(items, features)`` or
+        ``(batch, items, features)``. Each item is normalized to unit mass.
+
+    Returns
+    -------
+    torch.Tensor
+        A square ``(items, items)`` matrix for unbatched input, or
+        ``(batch, items, items)`` matrices for batched input.
+    """
+    unbatched = distributions.ndim == 2
+    if unbatched:
+        distributions = distributions.unsqueeze(0)
+    elif distributions.ndim != 3:
+        raise ValueError("distributions must have shape (items, features) or (batch, items, features).")
+
+    similarity = stats.hellinger_similarity(
+        distributions.unsqueeze(2), distributions.unsqueeze(1), dim=-1
+    )
+    identity = torch.eye(distributions.shape[1], dtype=torch.bool, device=distributions.device).unsqueeze(0)
+    similarity = torch.where(identity, torch.ones_like(similarity), similarity)
+    return similarity.squeeze(0) if unbatched else similarity
+
+
+def hellinger_distance_matrix(distributions: torch.Tensor):
+    """Construct pairwise Hellinger-distance matrices.
+
+    Input and output shapes follow :func:`hellinger_similarity_matrix`. The
+    returned square matrix can be passed directly to ``embed.MDScale``.
+    """
+    unbatched = distributions.ndim == 2
+    if unbatched:
+        distributions = distributions.unsqueeze(0)
+    elif distributions.ndim != 3:
+        raise ValueError("distributions must have shape (items, features) or (batch, items, features).")
+
+    distance = stats.hellinger_distance(
+        distributions.unsqueeze(2), distributions.unsqueeze(1), dim=-1
+    )
+    identity = torch.eye(distributions.shape[1], dtype=torch.bool, device=distributions.device).unsqueeze(0)
+    distance = torch.where(identity, torch.zeros_like(distance), distance)
+    return distance.squeeze(0) if unbatched else distance
+
+
 def pdist_general(X: torch.Tensor, metric, **kwargs):
     """
     Slow pdist only for small(ish) number of comparisons with arbitrary distance function.
@@ -101,9 +150,24 @@ def pdist_general(X: torch.Tensor, metric, **kwargs):
 
 
 def dissimilarity(beta: torch.Tensor, metric='dot', cov=None):
-    """
-    beta: Tensor, <batch, conditions, features>
-    return: rdm <batch, cond * (cond - 1) / 2>
+    """Construct condensed representational dissimilarity matrices.
+
+    Parameters
+    ----------
+    beta : torch.Tensor
+        Tensor with shape ``(conditions, features)`` or
+        ``(batch, conditions, features)``.
+    metric : str, default="dot"
+        Pairwise distance metric. ``"hellinger"`` treats each condition's
+        nonnegative feature vector as a possibly unnormalized distribution.
+    cov : torch.Tensor, optional
+        Covariance used by the Mahalanobis metric.
+
+    Returns
+    -------
+    torch.Tensor
+        Condensed upper triangles with shape
+        ``(batch, conditions * (conditions - 1) / 2)``.
     """
     if len(beta.shape) == 2:
         beta = beta.unsqueeze(0)
@@ -123,6 +187,10 @@ def dissimilarity(beta: torch.Tensor, metric='dot', cov=None):
         rdm = _euclidian_pdist(beta)
     elif metric == 'mahalanobis':
         rdm = mahalanobis_pdist(beta, cov)
+    elif metric == 'hellinger':
+        distance = hellinger_distance_matrix(beta)
+        indices = torch.triu_indices(beta.shape[1], beta.shape[1], offset=1, device=beta.device)
+        rdm = distance[:, indices[0], indices[1]]
     else:
         raise NotImplementedError
     if torch.sum(rdm < 0) > 0:
@@ -210,6 +278,4 @@ def circle_corr(sample, n, metric="rho"):
     else:
         raise ValueError
     return m
-
-
 

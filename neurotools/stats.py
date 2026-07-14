@@ -44,6 +44,48 @@ def symmetric_matrix_sqrt(matrix: torch.Tensor):
     return sqrt_matrix
 
 
+def _normalize_distribution(values: torch.Tensor, dim=-1, eps=1e-12, negative_tolerance=1e-9):
+    """Validate and normalize nonnegative values along a distribution dimension."""
+    if not isinstance(values, torch.Tensor):
+        raise TypeError("Distribution values must be provided as torch tensors.")
+    if not torch.is_floating_point(values):
+        values = values.float()
+    if not torch.isfinite(values).all():
+        raise ValueError("Distribution values must be finite.")
+    if torch.any(values < -negative_tolerance):
+        raise ValueError("Distribution values must be nonnegative.")
+
+    values = torch.clamp(values, min=0.)
+    mass = torch.sum(values, dim=dim, keepdim=True)
+    if torch.any(mass <= eps):
+        raise ValueError("Each distribution must have positive mass.")
+    return values / mass
+
+
+def hellinger_similarity(p: torch.Tensor, q: torch.Tensor, dim=-1, eps=1e-12):
+    """Return Hellinger similarity between possibly unnormalized distributions.
+
+    The similarity is the Bhattacharyya coefficient
+    ``sum(sqrt(p * q))`` after normalizing ``p`` and ``q`` along ``dim``. It is
+    one for identical distributions and zero for distributions with disjoint
+    support. Leading dimensions follow normal PyTorch broadcasting rules.
+    """
+    p = _normalize_distribution(p, dim=dim, eps=eps)
+    q = _normalize_distribution(q, dim=dim, eps=eps)
+    similarity = torch.sum(torch.sqrt(p) * torch.sqrt(q), dim=dim)
+    return torch.clamp(similarity, min=0., max=1.)
+
+
+def hellinger_distance(p: torch.Tensor, q: torch.Tensor, dim=-1, eps=1e-12):
+    """Return Hellinger distance between possibly unnormalized distributions.
+
+    This is ``sqrt(1 - hellinger_similarity(p, q))``, equivalently
+    ``||sqrt(p) - sqrt(q)|| / sqrt(2)`` for normalized distributions.
+    """
+    similarity = hellinger_similarity(p, q, dim=dim, eps=eps)
+    return torch.sqrt(torch.clamp(1. - similarity, min=0., max=1.))
+
+
 def pearson_correlation(x1: torch.Tensor, x2: torch.Tensor, dim=0):
     """
     compute pearson correlation between two vectors in a batched torch friendly wway.
