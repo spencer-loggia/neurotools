@@ -233,7 +233,7 @@ class MDScale:
         converged = False
         # loss_history, optim, batch_size, t
         while not converged:
-            optimizer, converged = util.is_converged(history, optimizer, 1, cur_iter, max_lr=1000)
+            optimizer, converged = util.is_converged(history, optimizer, 1, cur_iter, max_lr=self.lr)
             if cur_iter >= max_iter:
                 print("WARNING: Failed to converge in", max_iter, "iterations. Could be a solution was found, but the "
                                                                   "convergence tracker is dumb, just be careful!.")
