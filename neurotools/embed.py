@@ -41,7 +41,7 @@ class PCA:
 class MDScale:
 
     def __init__(self, n, embed_dims: int = 2, initialization="pca", device='cpu', struct="euclidean", weights=None,
-                 toroid_metric="surface", lr=.01):
+                 toroid_metric="surface", lr=.01, initial_angles=None):
         """Fit a multidimensional-scaling embedding to pairwise distances.
 
         Parameters
@@ -52,7 +52,9 @@ class MDScale:
             Number of Euclidean latent dimensions. ``struct="toroid"`` requires
             exactly two dimensions, interpreted as the angles ``(phi, theta)``.
         initialization : {"pca", "xavier"}, default="pca"
-            Initialization used for the latent coordinates.
+            Initialization used for Euclidean latent coordinates. Toroidal
+            coordinates are initialized uniformly over ``[0, 2*pi)`` unless
+            ``initial_angles`` is supplied.
         device : str or torch.device, default="cpu"
             Device used for optimization.
         struct : {"euclidean", "toroid"}, default="euclidean"
@@ -66,6 +68,11 @@ class MDScale:
             Distance used when ``struct="toroid"``. ``"surface"`` uses the
             intrinsic geodesic distance on the flat torus; ``"ambient"`` uses
             Euclidean chord distance between the corresponding points in R4.
+        lr : float, default=0.01
+            Initial Adam learning rate.
+        initial_angles : torch.Tensor or numpy.ndarray, optional
+            Initial toroidal ``(phi, theta)`` coordinates with shape ``(n, 2)``.
+            Values are interpreted as radians and wrapped into ``[0, 2*pi)``.
 
         Notes
         -----
@@ -81,6 +88,7 @@ class MDScale:
         self.structure = struct
         self.lr = lr
         self.toroid_metric = toroid_metric
+        self.initial_angles = None
         self.weights = weights
         if self.weights is not None:
             inds = torch.triu_indices(len(weights), len(weights), offset=1)
@@ -94,8 +102,19 @@ class MDScale:
             # Log-parameterization keeps both independently learned radii positive.
             self.log_rad_phi = torch.nn.Parameter(torch.zeros((), device=self.device))
             self.log_rad_theta = torch.nn.Parameter(torch.zeros((), device=self.device))
+            if initial_angles is not None:
+                initial_angles = torch.as_tensor(initial_angles, dtype=torch.float32)
+                if initial_angles.shape != (self.num_items, 2):
+                    raise ValueError(f"initial_angles must have shape {(self.num_items, 2)}.")
+                if not torch.isfinite(initial_angles).all():
+                    raise ValueError("initial_angles must be finite.")
+                self.initial_angles = torch.remainder(initial_angles.detach().clone(), 2 * torch.pi)
+        elif initial_angles is not None:
+            raise ValueError("initial_angles can only be used with struct='toroid'.")
 
         self.stress_history = None
+        self.normalized_stress_history = None
+        self.normalized_stress = None
         if initialization in ["pca", "xavier"]:
             self.initialization = initialization
         else:
@@ -106,6 +125,8 @@ class MDScale:
         if self.structure == "toroid":
             self.log_rad_phi = torch.nn.Parameter(self.log_rad_phi.detach().to(device))
             self.log_rad_theta = torch.nn.Parameter(self.log_rad_theta.detach().to(device))
+            if self.initial_angles is not None:
+                self.initial_angles = self.initial_angles.to(device)
         return self
 
     @property
@@ -211,10 +232,42 @@ class MDScale:
         """
         return self.distance_stress(pairwise_target, torch.pdist(positions), order=order)
 
+    def _initialize_toroid_embedding(self, dist_vec):
+        """Initialize phases across the torus and radii at the target-distance scale."""
+        if self.initial_angles is None:
+            angles = torch.rand((self.num_items, 2), device=self.device) * (2 * torch.pi)
+        else:
+            angles = self.initial_angles.to(self.device).clone()
+
+        positive_targets = dist_vec[dist_vec > 0]
+        if positive_targets.numel() == 0:
+            initial_radius = torch.tensor(1., dtype=dist_vec.dtype, device=self.device)
+        else:
+            initial_radius = torch.median(positive_targets) / torch.pi
+            initial_radius = torch.clamp(initial_radius, min=1e-3)
+        with torch.no_grad():
+            log_radius = torch.log(initial_radius).to(self.log_rad_phi.dtype)
+            self.log_rad_phi.copy_(log_radius)
+            self.log_rad_theta.copy_(log_radius)
+        return torch.nn.Parameter(angles)
+
+    def _target_stress_scale(self, dist_vec):
+        """Return the target norm used to report and optimize normalized stress."""
+        if self.weights is None:
+            target_energy = torch.sum(dist_vec.square())
+        else:
+            weights = torch.as_tensor(self.weights, dtype=dist_vec.dtype, device=dist_vec.device)
+            target_energy = torch.sum(weights * dist_vec.square())
+        return torch.sqrt(torch.clamp(target_energy, min=1e-12))
+
     def embed(self, dist_vec, max_iter=2000, tol=.001):
         history = []
+        normalized_history = []
         cur_iter = 0
-        if self.initialization == "xavier":
+        dist_vec = dist_vec.to(self.device)
+        if self.structure == "toroid":
+            embedding = self._initialize_toroid_embedding(dist_vec)
+        elif self.initialization == "xavier":
             embedding = torch.empty((self.num_items, self.components)).to(self.device)
             embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(embedding))
         elif self.initialization == "pca":
@@ -228,7 +281,7 @@ class MDScale:
             optimizer = torch.optim.Adam(lr=self.lr, params=[embedding, self.log_rad_phi, self.log_rad_theta])
         else:
             optimizer = torch.optim.Adam(lr=self.lr, params=[embedding])
-        dist_vec = dist_vec.to(self.device)
+        target_stress_scale = self._target_stress_scale(dist_vec)
         cur_iter = 0
         converged = False
         # loss_history, optim, batch_size, t
@@ -245,21 +298,30 @@ class MDScale:
             else:
                 loss = self.stress(dist_vec, embedding)
             history.append(loss.detach().cpu().item())
-            loss.backward()
+            normalized_loss = loss / target_stress_scale
+            normalized_history.append(normalized_loss.detach().cpu().item())
+            optimization_loss = normalized_loss if self.structure == "toroid" else loss
+            optimization_loss.backward()
             optimizer.step()
             cur_iter += 1
         self.stress_history = history
+        self.normalized_stress_history = normalized_history
+        self.normalized_stress = normalized_history[-1] if normalized_history else None
         return embedding
 
     def fit(self, pairwise_distance: torch.Tensor, max_iter=10000, tol=.001):
         dists = self.check_dists(pairwise_distance)
         self.right_latent = self.embed(dists[0], max_iter=max_iter)
+        self.right_normalized_stress = self.normalized_stress
         print("Right Initial System Tension: ", self.stress_history[0])
         print("Right Final System Tension: ", self.stress_history[-1])
+        print("Right Normalized Stress: ", self.right_normalized_stress)
         if len(dists) == 2:
             self.left_latent = self.embed(dists[1], max_iter=max_iter, tol=tol)
+            self.left_normalized_stress = self.normalized_stress
             print("Left Initial System Tension: ", self.stress_history[0])
             print("Left Final System Tension: ", self.stress_history[-1])
+            print("Left Normalized Stress: ", self.left_normalized_stress)
 
     def fit_transform(self, pairwise_distance, max_iter=10000, tol=.001):
         self.fit(pairwise_distance, max_iter=max_iter, tol=tol)

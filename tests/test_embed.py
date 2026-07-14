@@ -56,3 +56,43 @@ def test_toroid_requires_two_angles_and_a_supported_metric():
 
     with pytest.raises(ValueError, match="toroid_metric"):
         MDScale(3, struct="toroid", toroid_metric="invalid")
+
+
+def test_toroid_initialization_covers_phase_domain_and_scales_radii_to_targets():
+    torch.manual_seed(4)
+    model = MDScale(512, initialization="xavier", struct="toroid")
+    target = torch.linspace(0.1, 1.0, 512 * 511 // 2)
+
+    angles = model._initialize_toroid_embedding(target)
+
+    assert torch.all(angles >= 0.0)
+    assert torch.all(angles < 2.0 * np.pi)
+    assert torch.all(angles.std(dim=0) > 1.0)
+    expected_radius = torch.median(target) / torch.pi
+    assert torch.allclose(model.rad_phi, expected_radius)
+    assert torch.allclose(model.rad_theta, expected_radius)
+
+
+def test_toroid_uses_supplied_initial_angles_and_reports_normalized_stress():
+    levels = 5
+    axis = torch.arange(levels) * (2.0 * torch.pi / levels)
+    phi, theta = torch.meshgrid(axis, axis, indexing="ij")
+    initial_angles = torch.stack([phi.flatten(), theta.flatten()], dim=1)
+
+    source = MDScale(levels ** 2, struct="toroid")
+    with torch.no_grad():
+        source.log_rad_phi.copy_(torch.log(torch.tensor(0.2)))
+        source.log_rad_theta.copy_(torch.log(torch.tensor(0.35)))
+    target_vector = source.torus_distances(initial_angles).detach()
+
+    model = MDScale(
+        levels ** 2,
+        struct="toroid",
+        initial_angles=initial_angles,
+        lr=0.05,
+    )
+    model.embed(target_vector, max_iter=200)
+
+    expected_stress = model.stress_history[-1] / torch.linalg.vector_norm(target_vector).item()
+    assert model.normalized_stress == pytest.approx(expected_stress)
+    assert model.normalized_stress < 5e-3
